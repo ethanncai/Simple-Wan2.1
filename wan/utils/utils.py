@@ -28,6 +28,12 @@ def cache_video(tensor,
                 normalize=True,
                 value_range=(-1, 1),
                 retry=5):
+    """
+    Preassumption of this function
+    1. Shape should be BCTHW
+    2. Tensor range should be at [-1,1] range
+    """
+
     # cache file
     cache_file = osp.join('/tmp', rand_name(
         suffix=suffix)) if save_file is None else save_file
