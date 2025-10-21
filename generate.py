@@ -110,13 +110,6 @@ def _parse_args():
         help="Random seed for generation."
     )
     parser.add_argument(
-        "--sample_solver",
-        type=str,
-        default='unipc',
-        choices=['unipc', 'dpm++'],
-        help="The solver used to sample."
-    )
-    parser.add_argument(
         "--sample_steps",
         type=int,
         default=None,
@@ -171,7 +164,6 @@ def generate(args):
         size=SIZE_CONFIGS[args.size],
         frame_num=args.frame_num,
         shift=args.sample_shift,
-        sample_solver=args.sample_solver,
         sampling_steps=args.sample_steps,
         guide_scale=args.sample_guide_scale,
         seed=args.base_seed,

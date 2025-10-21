@@ -14,11 +14,6 @@ from tqdm import tqdm
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
-from .utils.fm_solvers import (
-    FlowDPMSolverMultistepScheduler,
-    get_sampling_sigmas,
-    retrieve_timesteps,
-)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
@@ -42,7 +37,7 @@ class WanT2V:
                 Whether to place T5 model on CPU during encoding.
         """
         self.device = torch.device("cuda:0")
-        self.config = model_hyperparam
+        self.model_hyperparam = model_hyperparam
         self.t5_cpu = t5_cpu
 
         self.num_train_timesteps = model_hyperparam.num_train_timesteps
@@ -79,7 +74,6 @@ class WanT2V:
         size=(1280, 720),
         frame_num=81,
         shift=5.0,
-        sample_solver='unipc',
         sampling_steps=50,
         guide_scale=5.0,
         n_prompt="",
@@ -157,28 +151,14 @@ class WanT2V:
         # Evaluation
         with amp.autocast(dtype=self.param_dtype), torch.no_grad(), noop():
 
-            if sample_solver == 'unipc':
-                sample_scheduler = FlowUniPCMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False
-                )
-                sample_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
-                timesteps = sample_scheduler.timesteps
-            elif sample_solver == 'dpm++':
-                sample_scheduler = FlowDPMSolverMultistepScheduler(
-                    num_train_timesteps=self.num_train_timesteps,
-                    shift=1,
-                    use_dynamic_shifting=False
-                )
-                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-                timesteps, _ = retrieve_timesteps(
-                    sample_scheduler,
-                    device=self.device,
-                    sigmas=sampling_sigmas
-                )
-            else:
-                raise NotImplementedError("Unsupported solver.")
+            sample_scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=1,
+                use_dynamic_shifting=False
+            )
+            sample_scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
+            timesteps = sample_scheduler.timesteps
+            
 
             latents = noise
             arg_c = {'context': context, 'seq_len': seq_len}
