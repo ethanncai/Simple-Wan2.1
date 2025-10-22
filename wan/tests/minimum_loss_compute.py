@@ -8,43 +8,13 @@ import torch.cuda.amp as amp
 from decord import VideoReader, cpu
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from PIL import Image
+from torch.utils.data import DataLoader
 
 from ..modules.model import WanModel
 from ..modules.t5 import T5EncoderModel
 from ..modules.vae import WanVAE
-
-def load_and_preprocess_video(video_path, frame_num=81, target_size=(480, 832)):
-    """
-    Returns:
-        torch.Tensor: shape (C, T, H, W), dtype float32, range [-1, 1]
-    """
-    vr = VideoReader(video_path, ctx=cpu(0))
-    total_frames = len(vr)
-
-    if total_frames == 0:
-        raise ValueError(f"Video {video_path} has 0 frames.")
-
-    # 确定实际要读取的原始帧索引
-    if total_frames >= frame_num:
-        indices = list(range(frame_num))  # [0, 1, 2, ..., frame_num-1]
-
-    frames = vr.get_batch(indices).asnumpy()  # (F, H_orig, W_orig, C), F == frame_num
-
-    H_target, W_target = target_size
-    transform = Compose([
-        ToTensor(),  # (H, W, C) -> (C, H, W), [0,1]
-        Resize((H_target, W_target), antialias=True),
-        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # -> [-1, 1]
-    ])
-
-    frame_list = []
-    for i in range(frames.shape[0]):
-        img = Image.fromarray(frames[i])
-        tensor = transform(img)  # (3, H, W)
-        frame_list.append(tensor)
-
-    video_tensor = torch.stack(frame_list, dim=1)  # (C, frame_num, H, W)
-    return video_tensor
+from ..utils.train_utils import load_and_preprocess_video, encode_video_and_text,print_gpu_memory
+from ..dataset.test_dataset import OneShotVideoDataset
 
 # ======================
 # 配置参数
@@ -61,35 +31,33 @@ patch_size = (1, 2, 2)
 text_len = 512
 t5_dtype = torch.bfloat16
 param_dtype = torch.bfloat16
-
-# 你的要求
-size_str = "832*480"  # 注意：W*H
-frame_num = 81
+size_str = "832*480"
 W, H = map(int, size_str.split('*'))  # W=832, H=480
+frame_num = 81
 
-# ======================
-# 用户输入：视频路径
-# ======================
-video_path = "/home/rapverse/workspace_junzhi/Wan2.1/t2v_832x480_cat_dancing_like_a_human_20251021_152920.mp4"  # ←←← 请修改为你自己的视频路径！
+video_path = "/home/rapverse/workspace_junzhi/Wan2.1/t2v_832x480_cat_dancing_like_a_human_20251021_152920.mp4"
+prompt_text = "a cat dancing like a human"
 
-# ======================
-# 加载并预处理视频
-# ======================
-print(f"Loading video from: {video_path}")
-video = load_and_preprocess_video(
-    video_path,
-    frame_num=frame_num,
-    target_size=(H, W)  # 注意：函数期望 (H, W)
+dataset = OneShotVideoDataset(
+    video_path=video_path,
+    text=prompt_text,
 )
-print(f"Loaded video tensor shape: {video.shape}")  # (3, F, H, W)
+
+dataloader = DataLoader(
+    dataset,
+    batch_size=4,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True if torch.cuda.is_available() else False,
+    collate_fn=lambda batch: ([v for v, t in batch], [t for v, t in batch])
+)
 
 # ======================
 # 加载模型
 # ======================
 print("Loading DiT...")
-# model = WanModel.from_pretrained(checkpoint_dir)
-model = WanModel()
-model.eval().requires_grad_(False)
+model = WanModel.from_pretrained(checkpoint_dir)
+# model.eval().requires_grad_(False)
 model.to(device)
 
 print("Loading VAE...")
@@ -110,66 +78,63 @@ text_encoder = T5EncoderModel(
 )
 
 # ======================
-# 计算 latent shape（用于 seq_len）
+# 推理 / 训练循环（单 batch 测试）
 # ======================
-target_shape = (
-    vae.model.z_dim,
-    (frame_num - 1) // vae_stride[0] + 1,  # T_z
-    H // vae_stride[1],                    # H_z
-    W // vae_stride[2]                     # W_z
-)
-seq_len = math.ceil(
-    (target_shape[2] * target_shape[3]) /
-    (patch_size[1] * patch_size[2]) *
-    target_shape[1]
-)
-print(f"Latent shape: {target_shape}, seq_len: {seq_len}")
+for i, (videos, texts) in enumerate(dataloader):
+    print(f"Batch {i}:")
+    print(f"  Number of videos: {len(videos)}")
+    print(f"  Video shape: {videos[0].shape}")   # (C, T, H, W)
+    print(f"  Texts: {texts}")
 
-# ======================
-# VAE 编码
-# ======================
-print("Encoding video with VAE...")
-video = video.to(device)
-with torch.no_grad():
-    latents = vae.encode([video])  # 传入 list
-x0 = latents[0]  # (C_z, T_z, H_z, W_z)
-print(f"x0 latent shape: {x0.shape}")
+    # Encode videos to latents and texts to embeddings
+    latents, context = encode_video_and_text(
+        videos=videos,
+        texts=texts,
+        vae=vae,
+        text_encoder=text_encoder,
+        vae_stride=vae_stride,
+        patch_size=patch_size,
+        device=device,
+        param_dtype=param_dtype
+    )
 
-# ======================
-# T5 编码
-# ======================
-prompt = "cat dancing like a human"
-print("Encoding prompt...")
-text_encoder.model.to(device)
-context = text_encoder([prompt], device)
-text_encoder.model.cpu()
-context = [t.to(device) for t in context]
+    print("Latent shape:", latents[0].shape)   # (C_z, T_z, H_z, W_z)
+    print("Context shape:", context[0].shape)  # (L, D)
 
-# ======================
-# Flow Matching 训练目标
-# ======================
-B = 1
-# t = torch.rand(B, device=device)
-t = torch.tensor([0.1], device=device)
-noise = torch.randn_like(x0)
+    # Compute sequence length for transformer
+    C_z, T_z, H_z, W_z = latents[0].shape
+    seq_len = math.ceil(
+        (H_z * W_z) / (patch_size[1] * patch_size[2]) * T_z
+    )
 
-t_view = t.view(B, 1, 1, 1, 1)
-x_t = (1 - t_view) * x0.unsqueeze(0) + t_view * noise.unsqueeze(0)
-x_t = x_t.squeeze(0)
+    # Stack latents into a batch tensor
+    x0_batch = torch.stack(latents, dim=0)  # (B, C_z, T_z, H_z, W_z)
+    B = x0_batch.shape[0]
 
-target_velocity = noise - x0
+    # Sample random timesteps: one per sample in the batch
+    t = torch.rand(B, device=device)  # shape: (B,)
 
-# ======================
-# 模型前向 & Loss
-# ======================
-print("Running model forward...")
-with amp.autocast(dtype=param_dtype):
-    velocity_pred = model(
-        x_t.unsqueeze(0),
-        t=t,
-        context=context,
-        seq_len=seq_len
-    )[0]
+    # Add noise: x_t = (1 - t) * x0 + t * noise
+    noise = torch.randn_like(x0_batch)
+    t_view = t.view(B, 1, 1, 1, 1)  # now always valid: (B, 1, 1, 1, 1)
+    x_t = (1 - t_view) * x0_batch + t_view * noise
+    target_velocity = noise - x0_batch  # velocity objective
 
-loss = F.mse_loss(velocity_pred, target_velocity)
-print(f"\nFlow Matching Loss: {loss.item():.6f}")
+    # Model forward
+    print("Running model forward...")
+    print_gpu_memory("before forward with grad")
+    with amp.autocast(dtype=param_dtype):
+        velocity_pred_list = model(
+            x_t,               # (B, C_z, T_z, H_z, W_z)
+            t=t,               # (B,)
+            context=context,   # List[(L, D)] of length B
+            seq_len=seq_len
+        )  # output: (B, C_z, T_z, H_z, W_z)
+    print_gpu_memory("after forward with grad")
+    velocity_pred = torch.stack(velocity_pred_list, dim=0)
+    print(velocity_pred.shape)
+    loss = F.mse_loss(velocity_pred, target_velocity)
+    print(f"\nFlow Matching Loss: {loss.item():.6f}")
+
+    # Only run one batch for testing
+    break

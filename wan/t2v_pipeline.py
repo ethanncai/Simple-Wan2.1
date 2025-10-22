@@ -6,6 +6,7 @@ import os
 import random
 import sys
 from contextlib import contextmanager
+from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 
 import torch
 import torch.cuda.amp as amp
@@ -17,7 +18,7 @@ from .modules.vae import WanVAE
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
-class WanT2V:
+class WanT2VPipeline:
 
     def __init__(
         self,
@@ -60,9 +61,15 @@ class WanT2V:
             vae_pth=os.path.join(checkpoint_dir, model_hyperparam.vae_checkpoint),
             device=self.device
         )
-
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+
+        self.model = WanModel()
+        state_dict = load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10222044/ds_epoch_1')
+
+        # 3. 加载到模型（strict=False 可跳过不匹配的键，比如 head 不同）
+        # self.model.load_state_dict(state_dict, strict=True)
+        
+        # self.model = WanModel.from_pretrained('/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10222044/hf_epoch_1')
         self.model.eval().requires_grad_(False)
         self.model.to(self.device)
 

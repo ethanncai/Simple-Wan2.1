@@ -152,14 +152,14 @@ def generate(args):
     logging.info(f"Input prompt: {args.prompt}")
 
     logging.info("Creating WanT2V pipeline.")
-    wan_t2v = wan.WanT2V(
+    wan_t2v_pipeline = wan.WanT2VPipeline(
         model_hyperparam=model_hyperparam,
         checkpoint_dir=args.ckpt_dir,
         t5_cpu=args.t5_cpu,
     )
 
     logging.info("Generating video...")
-    video = wan_t2v.generate(
+    video = wan_t2v_pipeline.generate(
         input_prompt=args.prompt,
         size=SIZE_CONFIGS[args.size],
         frame_num=args.frame_num,
