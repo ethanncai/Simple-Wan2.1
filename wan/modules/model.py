@@ -237,20 +237,22 @@ class I2VExtensionBlock(nn.Module):
         # alpha for residual short-circuit
         self.alpha = nn.Parameter(torch.tensor(alpha_init), requires_grad=True)
 
-    def forward(self, x, kwargs):
-        x_in = x  # 保存输入，用于大残差支路
-        img = kwargs['img']
-        e = kwargs['e']
-        seq_lens = kwargs['seq_lens']
-        grid_sizes = kwargs['grid_sizes']
-        freqs = kwargs['freqs']
-        context = kwargs['context']
-        context_lens = kwargs['context_lens']
-        
+    def forward(
+            self, 
+            x,
+            e,
+            seq_lens,
+            grid_sizes,
+            freqs,
+            context,
+            context_lens,
+            img ):
+        x_in = x 
         if img is not None:
             B, L, C = x.shape
             _, L_prime, _ = img.shape
             assert L_prime <= L and L % L_prime == 0
+            x = x.clone()  # 或者 x = x.detach().clone()
             x[:, :L_prime, :] = img
 
         with amp.autocast("cuda", dtype=torch.float32):
@@ -321,7 +323,12 @@ class WanAttentionBlock(nn.Module):
     def forward(
         self,
         x,
-        kwargs
+        e,
+        seq_lens,
+        grid_sizes,
+        freqs,
+        context,
+        context_lens,
     ):
         r"""
         Args:
@@ -331,13 +338,6 @@ class WanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        e = kwargs['e']
-        seq_lens = kwargs['seq_lens']
-        grid_sizes = kwargs['grid_sizes']
-        freqs = kwargs['freqs']
-        context = kwargs['context']
-        context_lens = kwargs['context_lens']
-        
         
         assert e.dtype == torch.float32
         with amp.autocast("cuda", dtype=torch.float32):
@@ -519,7 +519,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # self.img_emb = MLPProj(1280, dim)
 
         # initialize weights
-        self.init_weights()
+        # self.init_weights()1
 
     def forward(
         self,
@@ -560,6 +560,8 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # embeddings
         if img is not None:
+
+            assert img[0].dtype == self.patch_embedding.weight.dtype, f"img dtype {img[0].dtype} != model dtype {self.patch_embedding.weight.dtype}"
             img = [self.patch_embedding(u.unsqueeze(0)) for u in img]
             img = [u.flatten(2).transpose(1, 2) for u in img]
             img = torch.stack([u.squeeze(0) for u in img], dim=0)
@@ -578,7 +580,7 @@ class WanModel(ModelMixin, ConfigMixin):
         ])
 
         # time embeddings
-        with amp.autocast("cuda", dtype=torch.float32):
+        with torch.autocast(device_type="cuda", dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
@@ -609,8 +611,36 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             img=img,)
         
-        altering_forward = create_alternating_forward(self.blocks, self.i2v_extension_blocks, grad_checkpoint=grad_checkpoint)
-        x = altering_forward(x,kwargs)
+        # altering_forward = create_alternating_forward(self.blocks, self.i2v_extension_blocks, grad_checkpoint=grad_checkpoint)
+        max_len = max(len(self.blocks), len(self.i2v_extension_blocks))
+        for i in range(max_len):
+            if i < len(self.i2v_extension_blocks):
+                x = grad_checkpoint(
+                    self.i2v_extension_blocks[i],
+                    x,
+                    kwargs['e'],
+                    kwargs['seq_lens'],
+                    kwargs['grid_sizes'],
+                    kwargs['freqs'],
+                    kwargs['context'],
+                    kwargs['context_lens'],
+                    kwargs['img'],
+                    use_reentrant=False
+                )
+            if i < len(self.blocks):
+                x = grad_checkpoint(
+                    self.blocks[i],
+                    x,
+                    kwargs['e'],
+                    kwargs['seq_lens'],
+                    kwargs['grid_sizes'],
+                    kwargs['freqs'],
+                    kwargs['context'],
+                    kwargs['context_lens'],
+                    use_reentrant=False
+                )
+        # return x1
+        # x = altering_forward(x,kwargs)11
         # head
         x = self.head(x, e)
 

@@ -117,11 +117,10 @@ def print_gpu_memory(prefix):
 
 def encode_video_and_text(
     videos: List[torch.Tensor],
+    imgs: List[torch.Tensor],
     texts: List[str],
     vae,
     text_encoder,
-    vae_stride: Tuple[int, int, int] = (4, 8, 8),
-    patch_size: Tuple[int, int, int] = (1, 2, 2),
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     param_dtype: torch.dtype = torch.bfloat16,
     debug=False
@@ -129,33 +128,18 @@ def encode_video_and_text(
     assert len(videos) == len(texts), "Batch size mismatch between videos and texts"
 
     # Move VAE to device (assuming it's not already there)
-
-    # ======================
-    # Optional: log latent seq_len (for debugging)
-    # ======================
-    C, T, H, W = videos[0].shape
-    target_shape = (
-        vae.model.z_dim,
-        (T - 1) // vae_stride[0] + 1,  # T_z
-        H // vae_stride[1],            # H_z
-        W // vae_stride[2]             # W_z
-    )
-    seq_len = math.ceil(
-        (target_shape[2] * target_shape[3]) /
-        (patch_size[1] * patch_size[2]) *
-        target_shape[1]
-    )
-    # print(f"[Debug] Latent shape: {target_shape}, seq_len: {seq_len}")
-
     # ======================
     # VAE Encoding
     # ======================
     videos_on_device = [v.to(device) for v in videos]
+    imgs_on_device = [v.unsqueeze(1).to(device) for v in imgs]
+    assert videos_on_device[0].dtype == imgs_on_device[0].dtype
     if debug: print_gpu_memory('before moving vae to gpu')
     vae.model.to(device)
     if debug: print_gpu_memory('moved vae to gpu')
     with torch.no_grad(),torch.autocast(device_type="cuda", dtype=param_dtype):
         latents = vae.encode(videos_on_device)  # List[(C_z, T_z, H_z, W_z)]
+        img_latents = vae.encode(imgs_on_device)
     vae.model.to("cpu")
     if debug: print_gpu_memory('moved vae to cpu')
     torch.cuda.empty_cache()
@@ -173,8 +157,10 @@ def encode_video_and_text(
     torch.cuda.empty_cache()  # optional: free GPU memory if text encoder is large
 
     # Ensure context tensors are on device and correct dtype
-    context = [t.to(device).to(param_dtype) for t in context]
-    return latents, context
+    context = [t.to(param_dtype) for t in context]
+    latents = [t.to(param_dtype) for t in latents]
+    img_latents = [t.to(param_dtype) for t in img_latents]
+    return latents, context, img_latents
 
 def create_alternating_forward(*block_lists, grad_checkpoint):
     max_length = max(len(block_list) for block_list in block_lists) if block_lists else 0
@@ -186,7 +172,8 @@ def create_alternating_forward(*block_lists, grad_checkpoint):
     
     def alter_pass(x, c):
         for transformer_block in call_sequence:
-            x = grad_checkpoint(transformer_block, x, c)
+            # 关键改动：禁用 reentrant
+            x = grad_checkpoint(transformer_block, x, c, use_reentrant=False)
         return x
     
     return alter_pass

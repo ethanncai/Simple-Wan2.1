@@ -47,43 +47,48 @@ class OneShotVideoDataset(Dataset):
         return self.length
 
     def __getitem__(self, index):
-        # Randomly choose a start index for continuous segment
         import random
         start_idx = random.randint(0, self.max_start)
+
+        # 加载视频段
         video_tensor = load_and_preprocess_video_segment(
             self.video_path,
             start_idx=start_idx,
             frame_num=self.frame_num,
             target_size=self.target_size
-        )
-         
-        return video_tensor, random.choice(self.text)
+        )  # 输出 shape: (C, T, H, W)
+
+        # 取第一帧
+        first_frame = video_tensor[:, 0]  # shape: (C, H, W)
+
+        # 返回 video, text, first_frame
+        return video_tensor, random.choice(self.text), first_frame
 
 
 if __name__ == "__main__":
     video_path = "/home/rapverse/workspace_junzhi/Wan2.1/t2v_832x480_cat_dancing_like_a_human_20251021_152920.mp4"
-    prompt_text = "a cat dancing like a human"  # ←←← 你可以改成任意文本
+    prompt_text = ["prompt1","prompt2"]
     dataset = OneShotVideoDataset(
         video_path=video_path,
         text=prompt_text,
     )
     def collate_fn(batch):
-        videos, texts = zip(*batch)
-        return list(videos), list(texts)
-
+        videos, texts, imgs = zip(*batch)
+        return list(videos), list(texts), list(imgs)
     dataloader = DataLoader(
         dataset,
         batch_size=16,
         shuffle=False,
         num_workers=0,
         pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=lambda batch: ([v for v, t in batch], [t for v, t in batch])
+        collate_fn=collate_fn
     )
 
     # 测试 dataloader
-    for i, (videos, texts) in enumerate(dataloader):
+    for i, (videos, texts, imgs) in enumerate(dataloader):
         print(f"Batch {i}:")
-        print(f"  Video shape: {len(videos)}, {videos[0].shape}")   # (B, C, T, H, W)
-        print(f"  Texts: {texts}")                # List[str]，长度为 batch_size
+        print(f"  Video shape: {len(videos)}, {videos[0].shape}")   # (C, T, H, W)
+        print(f"  Texts: {texts}")
+        print(f"  First frame shape: {len(imgs)}, {imgs[0].shape}") # (C, H, W)
         if i >= 1:
             break

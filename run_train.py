@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--log_dir", type=str, default="runs")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=100000)
-    parser.add_argument("--save_every", type=int, default=1000)  # 默认以step计
+    parser.add_argument("--save_every", type=int, default=100)  # 默认以step计
     parser.add_argument("--log_every", type=int, default=5)    # 默认以step计
     parser.add_argument("--text_len", type=int, default=512)
     parser.add_argument("--frame_num", type=int, default=81)
@@ -97,8 +97,8 @@ def main():
 
     dataset = OneShotVideoDataset(video_path=video_path, text=prompt_text)
     def collate_fn(batch):
-        videos, texts = zip(*batch)
-        return list(videos), list(texts)
+        videos, texts, imgs = zip(*batch)
+        return list(videos), list(texts), list(imgs)
 
     dataloader = DataLoader(
         dataset,
@@ -155,10 +155,6 @@ def main():
     )
     print("Model loaded")
 
-    # autocast
-    use_bf16_autocast = (args.param_dtype == "bfloat16")
-    autocast_cm = torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16_autocast)
-
     # experiment dirs
     timestamp = get_timestamp()
     exp_name = f"exp_ds_{timestamp}"
@@ -180,21 +176,20 @@ def main():
         num_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            videos, texts = batch
+            videos, texts, imgs = batch
             B = len(videos)
             if B == 0:
                 continue
 
             # --- encode video + text (on CPU, then move to GPU) ---
             with torch.no_grad():
-                latents, context = encode_video_and_text(
+                latents, context, img_latents = encode_video_and_text(
                     videos=videos,
+                    imgs=imgs,
                     texts=texts,
                     vae=vae,
                     text_encoder=text_encoder,
-                    vae_stride=tuple(args.vae_stride),
-                    patch_size=tuple(args.patch_size),
-                    device=torch.device("cuda"),
+                    device=device,
                     param_dtype=torch.bfloat16
                 )
 
@@ -224,8 +219,8 @@ def main():
 
             # --- forward + loss ---
             ds_engine.optimizer.zero_grad(set_to_none=True)
-            with autocast_cm:
-                velocity_pred_list = ds_engine(x_t, t=t_model, context=context, seq_len=seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                velocity_pred_list = ds_engine(x_t, t=t_model, context=context, seq_len=seq_len, img=img_latents)
                 if isinstance(velocity_pred_list, (list, tuple)):
                     velocity_pred = torch.stack(velocity_pred_list, dim=0)
                 else:
