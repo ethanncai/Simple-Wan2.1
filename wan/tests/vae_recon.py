@@ -90,6 +90,7 @@ vae = WanVAE(
 video_tensor = video_tensor.to(device)
 with torch.no_grad():
     print("Encoding...")
+    print(video_tensor.dtype)
     latents = vae.encode([video_tensor])
     print(f"Latent shape: {latents[0].shape}")
 

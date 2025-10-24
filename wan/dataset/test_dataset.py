@@ -1,38 +1,63 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from ..utils.train_utils import load_and_preprocess_video
+from ..utils.train_utils import load_and_preprocess_video, load_and_preprocess_video_segment
+
 
 class OneShotVideoDataset(Dataset):
     def __init__(
         self,
         video_path,
         text,
-        length=3200,
+        length=18,
         frame_num=81,
-        target_size=(480, 832)
+        target_size=(480, 832),
+        seed=None
     ):
         """
         Args:
             video_path (str): 视频文件路径
             text (str): 对应的文本描述（所有样本共享）
-            length (int): 虚拟数据集长度
-            frame_num (int): 视频帧数
+            length (int): 虚拟数据集长度（即 epoch 中样本数）
+            frame_num (int): 每次采样的连续帧数
             target_size (tuple): (H, W)
+            seed (int, optional): 随机种子（用于可复现性）
         """
-        self.length = length
+        self.video_path = video_path
         self.text = text
-        self.video_tensor = load_and_preprocess_video(
-            video_path,
-            frame_num=frame_num,
-            target_size=target_size
-        )  # (C, T, H, W)
+        self.length = length
+        self.frame_num = frame_num
+        self.target_size = target_size
+
+        # Pre-check video length
+        from decord import VideoReader, cpu
+        vr = VideoReader(video_path, ctx=cpu(0))
+        self.total_frames = len(vr)
+        if self.total_frames < self.frame_num:
+            raise ValueError(f"Video has only {self.total_frames} frames, less than frame_num={frame_num}")
+
+        self.max_start = self.total_frames - self.frame_num
+
+        # Optional: set random seed for reproducibility in __getitem__
+        if seed is not None:
+            import random
+            random.seed(seed)
+            torch.manual_seed(seed)
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, index):
-        # 忽略 index，返回相同的 (video, text)
-        return self.video_tensor, self.text
+        # Randomly choose a start index for continuous segment
+        import random
+        start_idx = random.randint(0, self.max_start)
+        video_tensor = load_and_preprocess_video_segment(
+            self.video_path,
+            start_idx=start_idx,
+            frame_num=self.frame_num,
+            target_size=self.target_size
+        )
+         
+        return video_tensor, random.choice(self.text)
 
 
 if __name__ == "__main__":

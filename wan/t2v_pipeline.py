@@ -11,7 +11,7 @@ from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 import torch
 import torch.cuda.amp as amp
 from tqdm import tqdm
-
+from .utils.train_utils import load_weights
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
@@ -64,12 +64,12 @@ class WanT2VPipeline:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
         self.model = WanModel()
-        state_dict = load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10222044/ds_epoch_1')
+        # load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10240956/ds_epoch_19')
 
         # 3. 加载到模型（strict=False 可跳过不匹配的键，比如 head 不同）
         # self.model.load_state_dict(state_dict, strict=True)
-        
-        # self.model = WanModel.from_pretrained('/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10222044/hf_epoch_1')
+        # self.model.to_empty(self.device)
+        load_weights(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
         self.model.eval().requires_grad_(False)
         self.model.to(self.device)
 

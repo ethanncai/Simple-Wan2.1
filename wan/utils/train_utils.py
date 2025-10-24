@@ -9,10 +9,6 @@ import torch.cuda.amp as amp
 from decord import VideoReader, cpu
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from PIL import Image
-
-from wan.modules.model import WanModel
-from wan.modules.t5 import T5EncoderModel
-from wan.modules.vae import WanVAE
 import math
 from typing import List, Tuple
 import torch
@@ -49,6 +45,54 @@ def load_and_preprocess_video(video_path, frame_num=81, target_size=(480, 832)):
 
     video_tensor = torch.stack(frame_list, dim=1)  # (C, frame_num, H, W)
     return video_tensor
+
+from decord import VideoReader, cpu
+from torchvision.transforms import Compose, ToTensor, Resize, Normalize
+from PIL import Image
+import torch
+
+def load_and_preprocess_video_segment(
+    video_path,
+    start_idx,
+    frame_num=81,
+    target_size=(480, 832)
+):
+    """
+    Load a continuous segment of `frame_num` frames starting from `start_idx`.
+
+    Returns:
+        torch.Tensor: shape (C, T, H, W), dtype float32, range [-1, 1]
+    """
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total_frames = len(vr)
+
+    if total_frames < frame_num:
+        raise ValueError(f"Video {video_path} has only {total_frames} frames, less than required {frame_num}.")
+
+    # Ensure start_idx is valid
+    max_start = total_frames - frame_num
+    if start_idx < 0 or start_idx > max_start:
+        raise ValueError(f"Invalid start_idx {start_idx} for video with {total_frames} frames and segment length {frame_num}.")
+
+    indices = list(range(start_idx, start_idx + frame_num))  # [s, s+1, ..., s+frame_num-1]
+    frames = vr.get_batch(indices).asnumpy()  # (frame_num, H_orig, W_orig, C)
+
+    H_target, W_target = target_size
+    transform = Compose([
+        ToTensor(),  # (H, W, C) -> (C, H, W), [0,1]
+        Resize((H_target, W_target), antialias=True),
+        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # -> [-1, 1]
+    ])
+
+    frame_list = []
+    for i in range(frames.shape[0]):
+        img = Image.fromarray(frames[i])
+        tensor = transform(img)  # (3, H, W)
+        frame_list.append(tensor)
+
+    video_tensor = torch.stack(frame_list, dim=1)  # (C, frame_num, H, W)
+    return video_tensor
+
 import torch
 
 def print_gpu_memory(prefix):
@@ -131,3 +175,85 @@ def encode_video_and_text(
     # Ensure context tensors are on device and correct dtype
     context = [t.to(device).to(param_dtype) for t in context]
     return latents, context
+
+def create_alternating_forward(*block_lists, grad_checkpoint):
+    max_length = max(len(block_list) for block_list in block_lists) if block_lists else 0
+    call_sequence = []
+    for i in range(max_length):
+        for block_list in block_lists:
+            if i < len(block_list):
+                call_sequence.append(block_list[i])
+    
+    def alter_pass(x, c):
+        for transformer_block in call_sequence:
+            x = grad_checkpoint(transformer_block, x, c)
+        return x
+    
+    return alter_pass
+
+import torch
+import torch.nn as nn
+
+import torch
+import torch.nn as nn
+import torch
+import torch.nn as nn
+from safetensors.torch import load_file
+
+def load_weights(model: nn.Module, checkpoint_path: str, device="cpu"):
+    """
+    Native PyTorch 权重加载，支持 .pt/.bin 和 .safetensors，忽略缺失和形状不匹配的权重，并打印加载情况。
+    """
+    # 1. 如果模型是 meta tensor，先分配实际显存
+    try:
+        model = model.to(device)
+    except RuntimeError as e:
+        if "meta tensor" in str(e):
+            print("Meta tensor detected, using to_empty()...")
+            model = model.to_empty(device=device)
+
+    # 2. 加载 checkpoint
+    if checkpoint_path.endswith(".safetensors"):
+        checkpoint = load_file(checkpoint_path, device=device)
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # 3. 获取模型 state_dict
+    model_dict = model.state_dict()
+
+    # 统计信息
+    total_params = sum(p.numel() for p in model.parameters())
+    loaded_params = 0
+    missing_keys = []
+    unexpected_keys = []
+
+    # 4. 过滤 checkpoint，只加载 key 匹配且 shape 匹配的权重
+    filtered_dict = {}
+    for k, v in checkpoint.items():
+        if k in model_dict:
+            if v.shape == model_dict[k].shape:
+                filtered_dict[k] = v
+                loaded_params += v.numel()
+            else:
+                print(f"[Mismatch] {k}: checkpoint {v.shape} vs model {model_dict[k].shape}, skipping")
+                missing_keys.append(k)
+        else:
+            print(f"[Unexpected] {k} not in model, skipping")
+            unexpected_keys.append(k)
+
+    # 5. 找出模型中缺失的 key
+    for k in model_dict.keys():
+        if k not in filtered_dict:
+            missing_keys.append(k)
+
+    # 6. 更新权重
+    model_dict.update(filtered_dict)
+    model.load_state_dict(model_dict)
+
+    print(f"=== Load Summary ===")
+    print(f"Total model parameters: {total_params:,}")
+    print(f"Loaded parameters: {loaded_params:,} ({loaded_params/total_params*100:.2f}%)")
+    print(f"Missing keys (randomly initialized): {len(missing_keys)}")
+    print(f"Unexpected keys in checkpoint (ignored): {len(unexpected_keys)}")
+
+    return model, missing_keys, unexpected_keys
