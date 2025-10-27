@@ -46,6 +46,34 @@ def load_and_preprocess_video(video_path, frame_num=81, target_size=(480, 832)):
     video_tensor = torch.stack(frame_list, dim=1)  # (C, frame_num, H, W)
     return video_tensor
 
+import torch
+from torchvision.transforms import Compose, ToTensor, Resize, Normalize
+from PIL import Image
+
+def load_and_preprocess_image(image_path, target_size=(480, 832)):
+    """
+    Args:
+        image_path (str): 图片文件路径
+        target_size (tuple): (H, W)
+
+    Returns:
+        torch.Tensor: shape (C, 1, H, W), dtype float32, range [-1, 1]
+    """
+    H_target, W_target = target_size
+
+    transform = Compose([
+        ToTensor(),  # (H, W, C) -> (C, H, W)，范围 [0, 1]
+        Resize((H_target, W_target), antialias=True),
+        Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # -> [-1, 1]
+    ])
+
+    img = Image.open(image_path).convert("RGB")
+    tensor = transform(img).float()  # (3, H, W)
+    tensor = tensor.unsqueeze(1)     # (3, 1, H, W)
+
+    return tensor
+
+
 from decord import VideoReader, cpu
 from torchvision.transforms import Compose, ToTensor, Resize, Normalize
 from PIL import Image
@@ -121,11 +149,13 @@ def encode_video_and_text(
     texts: List[str],
     vae,
     text_encoder,
+    clip_encoder,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     param_dtype: torch.dtype = torch.bfloat16,
     debug=False
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     assert len(videos) == len(texts), "Batch size mismatch between videos and texts"
+
 
     # Move VAE to device (assuming it's not already there)
     # ======================
@@ -133,6 +163,7 @@ def encode_video_and_text(
     # ======================
     videos_on_device = [v.to(device) for v in videos]
     imgs_on_device = [v.unsqueeze(1).to(device) for v in imgs]
+    imgs_on_device = [v.repeat(1,4,1,1) for v in imgs_on_device]
     assert videos_on_device[0].dtype == imgs_on_device[0].dtype
     if debug: print_gpu_memory('before moving vae to gpu')
     vae.model.to(device)
@@ -140,6 +171,7 @@ def encode_video_and_text(
     with torch.no_grad(),torch.autocast(device_type="cuda", dtype=param_dtype):
         latents = vae.encode(videos_on_device)  # List[(C_z, T_z, H_z, W_z)]
         img_latents = vae.encode(imgs_on_device)
+        assert img_latents[0].shape[1] == 1,f"{img_latents[0].shape}"
     vae.model.to("cpu")
     if debug: print_gpu_memory('moved vae to cpu')
     torch.cuda.empty_cache()
@@ -156,11 +188,18 @@ def encode_video_and_text(
     if debug: print_gpu_memory('moved t5 to cpu')
     torch.cuda.empty_cache()  # optional: free GPU memory if text encoder is large
 
+    # ======================
+    # Clip Encoding
+    # ======================
+    with torch.no_grad(),torch.autocast(device_type="cuda", dtype=param_dtype):
+        clip_feat = [clip_encoder(v) for v in imgs_on_device]
+     # B,768
+
     # Ensure context tensors are on device and correct dtype
     context = [t.to(param_dtype) for t in context]
     latents = [t.to(param_dtype) for t in latents]
     img_latents = [t.to(param_dtype) for t in img_latents]
-    return latents, context, img_latents
+    return latents, context, img_latents, clip_feat
 
 def create_alternating_forward(*block_lists, grad_checkpoint):
     max_length = max(len(block_list) for block_list in block_lists) if block_lists else 0
@@ -244,3 +283,47 @@ def load_weights(model: nn.Module, checkpoint_path: str, device="cpu"):
     print(f"Unexpected keys in checkpoint (ignored): {len(unexpected_keys)}")
 
     return model, missing_keys, unexpected_keys
+
+
+import torch
+from typing import List
+
+def random_drop(x: List[torch.Tensor], drop_prob: float = 0.1):
+    if drop_prob <= 0 or len(x) == 0:
+        return x
+
+    B = len(x)
+    device = x[0].device
+    dtype = x[0].dtype
+
+    keep_mask = (torch.rand(B, device=device) > drop_prob).to(dtype)
+    out = []
+    for i in range(B):
+        if keep_mask[i] == 0:
+            out.append(torch.zeros_like(x[i], dtype=dtype, device=device))
+        else:
+            out.append(x[i])
+    return out
+
+def compute_dispersion_moduli(block_lists: List[List]) -> List[int]:
+    """
+    根据每个 block 列表的长度，动态计算模数，使得触发频率匹配其长度，
+    从而在 max_len 范围内均匀分散执行。
+    
+    允许模数重复，重点在于调度均匀性而非互质性。
+    """
+    if not block_lists:
+        return []
+    
+    lengths = [len(blk) for blk in block_lists]
+    max_len = max(lengths)
+    
+    moduli = []
+    for L in lengths:
+        if L == 0:
+            moduli.append(1)  # avoid div by zero; won't be used anyway
+        else:
+            # 目标：大约每 (max_len / L) 步触发一次
+            m = max(1, round(max_len / L))
+            moduli.append(m)
+    return moduli

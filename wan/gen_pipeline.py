@@ -11,14 +11,15 @@ from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 import torch
 import torch.cuda.amp as amp
 from tqdm import tqdm
-from .utils.train_utils import load_weights
+from .utils.train_utils import load_weights, load_and_preprocess_image
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
+from .modules.clip import ClipImageEncoder
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
-class WanT2VPipeline:
+class GenPipeline:
 
     def __init__(
         self,
@@ -61,15 +62,19 @@ class WanT2VPipeline:
             vae_pth=os.path.join(checkpoint_dir, model_hyperparam.vae_checkpoint),
             device=self.device
         )
+        # Load Clip
+        self.clip_encoder = ClipImageEncoder(model_name='ViT-B-32', pretrained='openai', device=self.device)
+        self.clip_encoder.eval()
+
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
         self.model = WanModel()
-        # load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10240956/ds_epoch_19')
+        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10280352/ds_step_60')
 
         # 3. 加载到模型（strict=False 可跳过不匹配的键，比如 head 不同）
         # self.model.load_state_dict(state_dict, strict=True)
-        # self.model.to_empty(self.device)
-        load_weights(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
+        # self.model.to_empty(self.device)/home/rapv
+        # load_weights(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
         self.model.eval().requires_grad_(False)
         self.model.to(self.device)
 
@@ -77,6 +82,7 @@ class WanT2VPipeline:
 
     def generate(
         self,
+        img_path,
         input_prompt,
         size=(1280, 720),
         frame_num=81,
@@ -106,6 +112,7 @@ class WanT2VPipeline:
             torch.Tensor: Video tensor of shape (C, N, H, W)
         """
         F = frame_num
+        W,H = size
         target_shape = (
             self.vae.model.z_dim,
             (F - 1) // self.vae_stride[0] + 1,
@@ -125,6 +132,14 @@ class WanT2VPipeline:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+
+        # Get init frame latent
+        img_tensor_pixle = load_and_preprocess_image(img_path, target_size=(H, W))
+        clip_feat = self.clip_encoder(img_tensor_pixle.unsqueeze(0))
+
+        img_tensor_pixle = [img_tensor_pixle.to(self.device)]
+        img_tensor_pixle = [v.repeat(1,4,1,1) for v in img_tensor_pixle]
+        img_latents = self.vae.encode(img_tensor_pixle)  # List[(L, D)]
 
         # Encode prompts
         if not self.t5_cpu:
@@ -176,8 +191,13 @@ class WanT2VPipeline:
                 timestep = torch.tensor([t], device=self.device)
 
                 self.model.to(self.device)
-                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(latent_model_input, t=timestep, **arg_null)[0]
+
+                # uncond_img_latents = [torch.zeros_like(u).to(u) for u in img_latents] # for cfg use
+                image_tensor = img_latents[0].clone() # CTHW
+            
+                assert len(image_tensor.shape) == 4
+                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c, img_latent=img_latents,clip_feat=clip_feat)[0]
+                noise_pred_uncond = self.model(latent_model_input, t=timestep, **arg_null, img_latent=img_latents,clip_feat=clip_feat)[0]
 
                 noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
@@ -190,7 +210,9 @@ class WanT2VPipeline:
                 )[0]
                 latents = [temp_x0.squeeze(0)]
 
+            latents[0][:,:1] = image_tensor
             x0 = latents
+            
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()

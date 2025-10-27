@@ -1,1 +1,1 @@
-from .t2v_pipeline import WanT2VPipeline
+from .gen_pipeline import GenPipeline

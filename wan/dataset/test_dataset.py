@@ -8,7 +8,7 @@ class OneShotVideoDataset(Dataset):
         self,
         video_path,
         text,
-        length=18,
+        length=1800,
         frame_num=81,
         target_size=(480, 832),
         seed=None

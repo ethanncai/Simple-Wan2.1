@@ -57,6 +57,11 @@ def _parse_args():
         description="Generate an image or video from a text prompt using Wan (single-GPU mode)"
     )
     parser.add_argument(
+        "--img_path",
+        type=str,
+        required=True,
+        help="initial frame")
+    parser.add_argument(
         "--task",
         type=str,
         default="t2v-14B",
@@ -152,7 +157,7 @@ def generate(args):
     logging.info(f"Input prompt: {args.prompt}")
 
     logging.info("Creating WanT2V pipeline.")
-    wan_t2v_pipeline = wan.WanT2VPipeline(
+    wan_t2v_pipeline = wan.GenPipeline(
         model_hyperparam=model_hyperparam,
         checkpoint_dir=args.ckpt_dir,
         t5_cpu=args.t5_cpu,
@@ -160,6 +165,7 @@ def generate(args):
 
     logging.info("Generating video...")
     video = wan_t2v_pipeline.generate(
+        img_path=args.img_path,
         input_prompt=args.prompt,
         size=SIZE_CONFIGS[args.size],
         frame_num=args.frame_num,

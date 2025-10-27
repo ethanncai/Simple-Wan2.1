@@ -1,7 +1,3 @@
-# run_train.py
-# DeepSpeed ZeRO-2 training for Wan2.1 T2V
-# 修正版：log & save 都以 global step 为参照
-# Author: 俊志 + GPT-5
 
 import os
 import gc
@@ -22,9 +18,9 @@ from wan.modules.model import WanModel
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
 from wan.dataset.test_dataset import OneShotVideoDataset
-from wan.utils.train_utils import encode_video_and_text, load_weights
-
-
+from wan.utils.train_utils import encode_video_and_text, load_weights, random_drop
+from wan.modules.clip import ClipImageEncoder
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def get_timestamp():
     return datetime.now().strftime("%m%d%H%M")
 
@@ -37,7 +33,7 @@ def parse_args():
     parser.add_argument("--log_dir", type=str, default="runs")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=100000)
-    parser.add_argument("--save_every", type=int, default=100)  # 默认以step计
+    parser.add_argument("--save_every", type=int, default=60)  # 默认以step计
     parser.add_argument("--log_every", type=int, default=5)    # 默认以step计
     parser.add_argument("--text_len", type=int, default=512)
     parser.add_argument("--frame_num", type=int, default=81)
@@ -46,7 +42,7 @@ def parse_args():
     parser.add_argument("--patch_size", nargs=3, type=int, default=[1, 2, 2])
     parser.add_argument("--param_dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
     parser.add_argument("--t5_dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"])
-
+    parser.add_argument("--cfg_drop_prob", type=float, default=0.1)
     # DeepSpeed config path (always using DS)
     parser.add_argument("--ds_config", type=str, default="ds_config_zero2.json", help="DeepSpeed config path")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="Override GA steps in ds_config")
@@ -110,7 +106,6 @@ def main():
     )
 
     # Load model
-    print("Loading DiT...")
     model = WanModel()
     load_weights(model,'/home/rapverse/workspace_junzhi/Wan2.1/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
     model.train()
@@ -122,6 +117,7 @@ def main():
         model_parameters=filter(lambda p: p.requires_grad, model.parameters()),
         config=args.ds_config
     )
+    print(f"[rank {ds_engine.global_rank}] Spwaned...")
 
     device = ds_engine.device
     is_rank0 = (ds_engine.global_rank == 0)
@@ -139,11 +135,15 @@ def main():
         print(f"{'Trainable Parameters':<25}: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
         print("=" * 60 + "\n")
 
-    print("Loading VAE...")
+    print(f"[rank {ds_engine.global_rank}] Loading VAE...")
     vae_checkpoint = os.path.join(args.checkpoint_dir, 'Wan2.1_VAE.pth')
     vae = WanVAE(vae_pth=vae_checkpoint, dtype=param_dtype, device=device)
 
-    print("Loading T5...")
+    print(f"[rank {ds_engine.global_rank}] Loading Clip...")
+    encoder = ClipImageEncoder(model_name='ViT-B-32', pretrained='openai', device=device)
+    encoder.eval()
+
+    print(f"[rank {ds_engine.global_rank}] Loading T5...")
     t5_checkpoint = os.path.join(args.checkpoint_dir, 'models_t5_umt5-xxl-enc-bf16.pth')
     text_encoder = T5EncoderModel(
         text_len=args.text_len,
@@ -153,8 +153,8 @@ def main():
         tokenizer_path='google/umt5-xxl',
         shard_fn=None
     )
-    print("Model loaded")
-
+    print(f"[rank {ds_engine.global_rank}] All Model loaded")
+    assert torch.distributed.is_available(), "torch.distributed is not available"
     # experiment dirs
     timestamp = get_timestamp()
     exp_name = f"exp_ds_{timestamp}"
@@ -183,16 +183,22 @@ def main():
 
             # --- encode video + text (on CPU, then move to GPU) ---
             with torch.no_grad():
-                latents, context, img_latents = encode_video_and_text(
+                latents, context, img_latents, clip_feat = encode_video_and_text(
                     videos=videos,
                     imgs=imgs,
                     texts=texts,
                     vae=vae,
                     text_encoder=text_encoder,
+                    clip_encoder=encoder,
                     device=device,
                     param_dtype=torch.bfloat16
                 )
+                # img_latents = random_drop(img_latents, drop_prob=args.cfg_drop_prob)
 
+            img_latents = torch.stack(img_latents, dim=0).to(device, dtype=param_dtype)
+            assert img_latents.shape[2] == 1
+            
+            clip_feat = torch.stack(clip_feat, dim=0).to(device, dtype=param_dtype)
             x_1 = torch.stack(latents, dim=0).to(device, dtype=param_dtype)
             context = to_device_dtype(context, device, dtype=param_dtype)
 
@@ -207,12 +213,15 @@ def main():
 
             # x_0 = random noise
             x_0 = torch.randn_like(x_1, device=device, dtype=param_dtype)
+            # img_target = x_0[:,:,:1,...] - img_latents
 
             # mix latents and noise
             x_t = (1.0 - t_frac_exp) * x_1 + t_frac_exp * x_0
 
             # target = x_0 - x_1
-            target = x_0 - x_1
+            target = x_0 - x_1 # x_1 BCTHW
+
+            
 
             # model expects timestep [0,1000]
             t_model = (t_frac * 1000.0).to(device=device, dtype=param_dtype)
@@ -220,7 +229,14 @@ def main():
             # --- forward + loss ---
             ds_engine.optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                velocity_pred_list = ds_engine(x_t, t=t_model, context=context, seq_len=seq_len, img=img_latents)
+                
+                velocity_pred_list = ds_engine(x_t,
+                                                t=t_model,
+                                                context=context,
+                                                seq_len=seq_len, 
+                                                img_latent=img_latents,
+                                                clip_feat=clip_feat)
+                
                 if isinstance(velocity_pred_list, (list, tuple)):
                     velocity_pred = torch.stack(velocity_pred_list, dim=0)
                 else:
@@ -240,17 +256,45 @@ def main():
             if is_rank0 and (global_step % args.log_every == 0):
                 writer.add_scalar("Loss/train", loss_val, global_step)
                 print(f"[Step {global_step}] Loss: {loss_val:.6f}")
+                alphas = []
+                for block in ds_engine.module.img_conditioned_blocks:
+                    alpha_val = block.alpha.item() if hasattr(block, 'alpha') else 0.0
+                    alphas.append(alpha_val)
+                
+                if alphas:
+                    avg_alpha = sum(alphas) / len(alphas)
+                    writer.add_scalar("Alpha/mean", avg_alpha, global_step)
+                    writer.add_scalar("Alpha/min", min(alphas), global_step)
+                    writer.add_scalar("Alpha/max", max(alphas), global_step)
+                    print(f"[Step {global_step}] Alpha: mean={avg_alpha:.6f}, min={min(alphas):.6f}, max={max(alphas):.6f}")
 
             # --- checkpoint save by global step ---
-            if is_rank0 and (global_step % args.save_every == 0):
+            if global_step % args.save_every == 0:
                 ckpt_dir = os.path.join(exp_dir, f"ds_step_{global_step}")
-                ds_engine.save_checkpoint(ckpt_dir, tag=f"global_step_{global_step}")
 
-            # cleanup per batch
-            del x_t, x_0, x_1, target, loss
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # 只有 rank0 负责创建目录，避免 race
+                if is_rank0:
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    print(f"[rank{ds_engine.global_rank}] created checkpoint dir {ckpt_dir}")
+
+                # 确保 torch.distributed 已初始化，然后使用 torch.distributed.barrier()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                else:
+                    # 如果没有初始化分布式（理论上由 deepspeed.initialize 已做），打印提示
+                    if is_rank0:
+                        print("Warning: torch.distributed is not initialized; skipping barrier()")
+
+                # 所有 rank 都调用 DeepSpeed 的 save_checkpoint（ZeRO 状态需要每个进程参与）
+                try:
+                    save_ret = ds_engine.save_checkpoint(ckpt_dir, tag=f"global_step_{global_step}")
+                    if is_rank0:
+                        print(f"[rank{ds_engine.global_rank}] save_checkpoint returned: {save_ret}")
+                except Exception as e:
+                    # 打印错误方便定位
+                    print(f"[rank{ds_engine.global_rank}] Exception during save_checkpoint: {e}")
+
+
 
         # --- optional epoch summary (still useful for logging) ---
         avg_loss = epoch_loss / max(1, num_batches)
