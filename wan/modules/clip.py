@@ -62,7 +62,7 @@ if __name__ == "__main__":
     encoder = ClipImageEncoder(model_name='ViT-B-32', pretrained='openai', device=device)
     encoder.eval()
 
-    img_path = "/home/rapverse/workspace_junzhi/Wan2.1/wan/dataset/assets/test_init_frame.jpg"
+    img_path = "/home/rapverse/workspace_junzhi/Simple-Wan2.1/wan/dataset/assets/init_frame.jpg"
 
     img_tensor = load_and_preprocess_image(img_path, target_size=(480, 832))  # (C, 1, H, W)
     print(f"Preprocessed image tensor shape: {img_tensor.shape}")

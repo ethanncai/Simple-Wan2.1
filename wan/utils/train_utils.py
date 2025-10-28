@@ -11,7 +11,140 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from PIL import Image
 import math
 from typing import List, Tuple
+import numpy as np
+import cv2
+from decord import VideoReader, cpu
+
+def video_to_cthw(video_path):
+    vr = VideoReader(video_path, ctx=cpu(0))
+    total_frames = len(vr)
+
+    if total_frames == 0:
+        raise ValueError(f"Video {video_path} has no frames.")
+    frames = vr.get_batch(range(total_frames)).asnumpy()
+    frames = torch.from_numpy(frames).permute(0, 3, 1, 2).float()  # (T, H, W, C) -> (T, C, H, W)
+    frames = frames / 127.5 - 1.0
+    video_tensor = frames.permute(1, 0, 2, 3)  # (C, T, H, W)
+    return video_tensor.contiguous()
+
+
 import torch
+import numpy as np
+import imageio.v3 as iio   # imageio >=2.9
+from typing import Union, Tuple
+
+def cthw_to_video(video_tensor: torch.Tensor,
+                  output_path: str,
+                  fps: int = 16,
+                  crf: int = 18,          # 视觉无损，越小越清晰
+                  macro_block_size: int = 16) -> None:
+
+    if video_tensor.ndim != 4 or video_tensor.shape[0] != 3:
+        raise ValueError("Input must be (3, T, H, W)")
+
+    frames = ((video_tensor.permute(1, 2, 3, 0) + 1.0) * 127.5).clamp(0, 255)
+    frames: np.ndarray = frames.cpu().numpy().astype(np.uint8)  # (T, H, W, 3)
+
+    T, H, W, _ = frames.shape
+
+    pad_h = (macro_block_size - H % macro_block_size) % macro_block_size
+    pad_w = (macro_block_size - W % macro_block_size) % macro_block_size
+    if pad_h or pad_w:
+        frames = np.pad(frames,
+                        ((0, 0), (0, pad_h), (0, pad_w), (0, 0)),
+                        mode='edge')
+
+    iio.imwrite(output_path,
+                frames,
+                fps=fps,
+                codec='libx264',
+                pixelformat='yuv420p',
+                output_params=['-crf', str(crf),
+                               '-preset', 'medium'])
+
+
+def resize_but_retain_ratio(clip, target_size):
+    """
+    Performs a "cover" resize: scales the video while preserving aspect ratio so that
+    the entire target area is covered, then center-crops to match the target aspect ratio,
+    and finally resizes to exact target resolution.
+
+    Args:
+        clip (torch.Tensor): Video of shape (C, T, H, W), dtype float (any range).
+        target_size (tuple): (H_out, W_out), e.g., (480, 832)
+
+    Returns:
+        torch.Tensor: Video of shape (C, T, H_out, W_out)
+    """
+    C, T, H_in, W_in = clip.shape
+    H_out, W_out = target_size
+
+    # Compute target aspect ratio
+    target_aspect = W_out / H_out
+    input_aspect = W_in / H_in
+
+    # Step 1: Determine scale factor to ensure full coverage ("cover" mode)
+    if input_aspect > target_aspect:
+        # Input is wider → scale based on height
+        scale = H_out / H_in
+    else:
+        # Input is taller or same ratio → scale based on width
+        scale = W_out / W_in
+
+    # Apply scale to get intermediate size
+    new_H = int(round(H_in * scale))
+    new_W = int(round(W_in * scale))
+
+    # Step 2: Temporarily reshape to (C*T, 1, H, W) for interpolation
+    # But F.interpolate expects (N, C, H, W), so we merge C and T into batch dim
+    clip_reshaped = clip.view(C * T, 1, H_in, W_in)  # (C*T, 1, H, W)
+    clip_scaled = F.interpolate(
+        clip_reshaped,
+        size=(new_H, new_W),
+        mode='bilinear',
+        align_corners=False,
+        antialias=True
+    )  # (C*T, 1, new_H, new_W)
+    clip_scaled = clip_scaled.view(C, T, new_H, new_W)
+
+    # Step 3: Center crop to match target aspect ratio in the scaled space
+    if new_H >= H_out and new_W >= W_out:
+        if abs(new_W / new_H - target_aspect) < 1e-6:
+            clip_cropped = clip_scaled
+        else:
+            if new_W / new_H > target_aspect:
+                # Too wide: fix height, adjust width
+                crop_h = new_H
+                crop_w = int(round(crop_h * target_aspect))
+            else:
+                # Too tall: fix width, adjust height
+                crop_w = new_W
+                crop_h = int(round(crop_w / target_aspect))
+
+            crop_h = min(crop_h, new_H)
+            crop_w = min(crop_w, new_W)
+
+            top = (new_H - crop_h) // 2
+            left = (new_W - crop_w) // 2
+            clip_cropped = clip_scaled[:, :, top:top + crop_h, left:left + crop_w]
+    else:
+        # Scaled video smaller than target in one dimension → skip crop
+        clip_cropped = clip_scaled
+
+    # Step 4: Final resize to exact target size
+    C2, T2, H_c, W_c = clip_cropped.shape
+    clip_reshaped_final = clip_cropped.view(C2 * T2, 1, H_c, W_c)
+    clip_final = F.interpolate(
+        clip_reshaped_final,
+        size=(H_out, W_out),
+        mode='bilinear',
+        align_corners=False,
+        antialias=True
+    ).view(C2, T2, H_out, W_out)
+
+    return clip_final
+
+
 
 def load_and_preprocess_video(video_path, frame_num=81, target_size=(480, 832)):
     """
@@ -306,12 +439,7 @@ def random_drop(x: List[torch.Tensor], drop_prob: float = 0.1):
     return out
 
 def compute_dispersion_moduli(block_lists: List[List]) -> List[int]:
-    """
-    根据每个 block 列表的长度，动态计算模数，使得触发频率匹配其长度，
-    从而在 max_len 范围内均匀分散执行。
-    
-    允许模数重复，重点在于调度均匀性而非互质性。
-    """
+
     if not block_lists:
         return []
     

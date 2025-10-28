@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from ..utils.train_utils import load_and_preprocess_video, load_and_preprocess_video_segment
+from ..utils.train_utils import load_and_preprocess_video_segment
 
 
 class OneShotVideoDataset(Dataset):

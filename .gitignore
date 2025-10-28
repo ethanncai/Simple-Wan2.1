@@ -14,13 +14,13 @@
 *.pth
 *.ckpt
 *.safetensors
-*.json
 # *.txt
 *.backup
 *.pkl
 *.html
 *.pdf
 *.whl
+*.cached
 cache
 __pycache__/
 storage/

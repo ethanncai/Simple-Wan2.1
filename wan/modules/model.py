@@ -507,8 +507,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         max_len = max([len(block) for block in self.transformer_block_lists])
         self.moduli = compute_dispersion_moduli(self.transformer_block_lists)
-        assert max_len == len(self.blocks)
-        print(f"{self.moduli[1]=}")
+        assert max_len == len(self.blocks), f"max len is {max_len}, not block len: {len(self.blocks)}"
 
 
     def forward(
@@ -696,7 +695,7 @@ def test_wan_model():
     dim = 256     # Hidden dimension (reduced for testing)
     ffn_dim = 1024  # Feed-forward network dimension
     num_heads = 4  # Number of attention heads
-    num_layers = 2  # Number of transformer layers
+    num_layers = 30  # Number of transformer layers
     text_dim = 4096  # Text embedding dimension
     frames = 8  # Number of frames
     height = 32  # Frame height

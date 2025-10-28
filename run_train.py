@@ -28,7 +28,7 @@ def get_timestamp():
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Wan2.1 Text-to-Video Model (DeepSpeed ZeRO-2)")
     # core training args
-    parser.add_argument("--checkpoint_dir", type=str, default="/home/rapverse/workspace_junzhi/Wan2.1/Wan2.1-T2V-1.3B")
+    parser.add_argument("--checkpoint_dir", type=str, default="/home/rapverse/workspace_junzhi/datasets_ckpts/Wan2.1-T2V-1.3B")
     parser.add_argument("--output_dir", type=str, default="exp")
     parser.add_argument("--log_dir", type=str, default="runs")
     parser.add_argument("--batch_size", type=int, default=4)
@@ -82,13 +82,12 @@ def main():
     ps_t, ps_h, ps_w = args.patch_size
 
     # Demo dataset
-    video_path = "/home/rapverse/workspace_junzhi/dataset/train/392-651388-007/head_color.mp4"
+    video_path = "/home/rapverse/workspace_junzhi/datasets_ckpts/train/367-648961-000/head_color.mp4"
     prompt_text = [
-        "POV of a pair of junzhi robot arm doing something",
-        "POV of junzhi robot and it is doing something",
-        "First person view of a junzhi brand robot arm and it is doing something",
-        "POV of a pair of junzhi robot gripper",
-        "First person view of a junzhi brand robot gripper and it is doing something",
+        "POV of a pair of junzhi robot arm are handling toast",
+        "POV of junzhi robot and it is handling toast",
+        "POV of a pair of junzhi robot gripper and it is handling toast",
+        "First person view of a junzhi brand robot gripper and it is handling toast",
     ]
 
     dataset = OneShotVideoDataset(video_path=video_path, text=prompt_text)
@@ -107,7 +106,7 @@ def main():
 
     # Load model
     model = WanModel()
-    load_weights(model,'/home/rapverse/workspace_junzhi/Wan2.1/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
+    load_weights(model,'/home/rapverse/workspace_junzhi/datasets_ckpts/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
     model.train()
 
     # DeepSpeed initialize

@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e  # 遇到错误立即退出
-
+export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 NUM_GPUS=8
 
