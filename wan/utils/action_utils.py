@@ -153,7 +153,7 @@ def get_traj(sample_size, action, w2c, c2w, intrinsic, radius=50):
     all_img_list = rearrange(torch.tensor(all_img_list), "v t h w c -> c v t h w").float()
     return all_img_list
 
-def get_action_with_vp(h5_path,in_json_path,ex_json_path, resolution=(480, 640), radius=50, output_vp=False):
+def get_action_with_vp(h5_path,in_json_path,ex_json_path, resolution=(480, 640), radius=50, output_vp=False,action_transform=None):
     """
     Generate raw absolute actions and Visual Prompt (trajectory) in CTHW format.
 
@@ -170,8 +170,10 @@ def get_action_with_vp(h5_path,in_json_path,ex_json_path, resolution=(480, 640),
         ends_o = np.array(fid["state/end/orientation"], dtype=np.float32)
     raw_actions = get_actions(gripper, ends_p, ends_o)  # (T, 16)
     
+    raw_actions = torch.tensor(raw_actions)
+    transformed_action = action_transform(raw_actions)
     if not output_vp:
-        return torch.tensor(raw_actions,dtype=float), None
+        return transformed_action, None
 
     # 2. Load camera params (use first frame extrinsic)
     with open(ex_json_path, "r") as f:
@@ -204,7 +206,7 @@ def get_action_with_vp(h5_path,in_json_path,ex_json_path, resolution=(480, 640),
     # 4. Remove the view dimension (V=1) → (C, T, H, W)
     vp_traj = traj_ctvhw.squeeze(1)  # Now (3, T, 720, 1280)
 
-    return torch.tensor(raw_actions,dtype=float), torch.tensor(vp_traj,dtype=float)
+    return transformed_action, torch.tensor(vp_traj,dtype=float)
 
 
 
@@ -238,7 +240,13 @@ def approximate_stats_from_samples(sample_dirs, radius=50, sample_ratio=9.9, see
 
     for sample_dir in tqdm(sample_dirs, desc="Processing samples"):
         try:
-            actions_tensor, _ = get_action_with_vp(sample_dir, radius=radius, output_vp=False)
+            ex_json_path = os.path.join(sample_dir,
+                                    "head_extrinsic_params_aligned.json")
+            in_json_path = os.path.join(sample_dir,
+                                        "head_intrinsic_params.json")
+            h5_json_path = os.path.join(sample_dir,
+                                        "proprio_stats.h5")
+            actions_tensor, _ = get_action_with_vp(h5_json_path, in_json_path, ex_json_path, radius=50, output_vp=False, action_transform=action_relative_to_0)
             # Ensure shape is [T, C]
             if actions_tensor.dim() == 3 and actions_tensor.shape[-1] == 1:
                 actions_tensor = actions_tensor.squeeze(-1)  # [T, C, 1] -> [T, C]
@@ -295,19 +303,45 @@ def approximate_stats_from_samples(sample_dirs, radius=50, sample_ratio=9.9, see
         'num_samples_used': len(sample_dirs)
     }
 
+import torch
+
 ACTION_MEAN = torch.tensor([
-    0.6915, 0.2827, 0.7607, -0.1620, 0.5256,
-    -0.4192, 0.0609, 67.8814, 0.6762, -0.2996,
-    0.7463, -0.1460, 0.1242, 0.0477, 0.2487,
-    66.8053
-])
+    0.0186,   # Channel 0
+    -0.0006,  # Channel 1
+    -0.0061,  # Channel 2
+    -0.0058,  # Channel 3
+    0.0039,   # Channel 4
+    0.0322,   # Channel 5
+    0.0368,   # Channel 6
+    7.8852,   # Channel 7
+    0.0144,   # Channel 8
+    0.0109,   # Channel 9
+    -0.0215,  # Channel 10
+    0.1183,   # Channel 11
+    -0.0441,  # Channel 12
+    -0.0006,  # Channel 13
+    -0.0855,  # Channel 14
+    10.8845,  # Channel 15
+], dtype=torch.float32)
 
 ACTION_STD = torch.tensor([
-    0.0816, 0.0777, 0.1253, 0.4088, 0.4137,
-    0.3477, 0.1970, 38.4463, 0.0728, 0.0962,
-    0.1345, 0.6559, 0.4494, 0.1656, 0.4779,
-    38.6706
-])
+    0.0708,   # Channel 0
+    0.0514,   # Channel 1
+    0.0490,   # Channel 2
+    0.2533,   # Channel 3
+    0.2302,   # Channel 4
+    0.2535,   # Channel 5
+    0.1583,   # Channel 6
+    31.6437,  # Channel 7
+    0.0590,   # Channel 8
+    0.0791,   # Channel 9
+    0.0620,   # Channel 10
+    0.5519,   # Channel 11
+    0.4618,   # Channel 12
+    0.1966,   # Channel 13
+    0.4032,   # Channel 14
+    37.0041,  # Channel 15
+], dtype=torch.float32)
 
 def scale_action(action: torch.Tensor) -> torch.Tensor:
     """
@@ -355,13 +389,37 @@ def unscale_action(normalized_action: torch.Tensor) -> torch.Tensor:
 
     mean = ACTION_MEAN.to(normalized_action.device, dtype=normalized_action.dtype)
     std = ACTION_STD.to(normalized_action.device, dtype=normalized_action.dtype)
-
     original = normalized_action * std + mean
 
     if squeezed:
         original = original.unsqueeze(-1)
 
     return original
+
+
+def action_relative_to_0(action: torch.Tensor) -> torch.Tensor:
+    if action.ndim != 2:
+        raise ValueError(f"Expected [T, dim], got {action.shape}")
+    if action.shape[0] == 0:
+        return action
+    return action - action[0:1]  # broadcasting: [T, dim] - [1, dim]
+
+
+# if __name__ == "__main__":
+#     base_dir = "/home/rapverse/workspace_junzhi/datasets_ckpts/train"
+#     sample_dirs = [os.path.join(base_dir, d) for d in os.listdir(base_dir)
+#                    if os.path.isdir(os.path.join(base_dir, d))]
+
+#     # Optional: shuffle or sort if needed
+#     # sample_dirs = sorted(sample_dirs)
+
+#     # Run approximation (e.g., use 10% of data for speed)
+#     stats = approximate_stats_from_samples(
+#         sample_dirs,
+#         radius=50,
+#         sample_ratio=0.9,  # change to 1.0 for full dataset (slow!)
+#         seed=42
+#     )
 
 
 if __name__ == "__main__":
@@ -374,7 +432,7 @@ if __name__ == "__main__":
                                 "proprio_stats.h5")
 
 
-    actions_tensor, _ = get_action_with_vp(h5_json_path, in_json_path, ex_json_path, radius=50, output_vp=False, action_transform=None)
+    actions_tensor, _ = get_action_with_vp(h5_json_path, in_json_path, ex_json_path, radius=50, output_vp=False, action_transform=action_relative_to_0)
 
     actions_tensor_ = actions_tensor.clone()
     print(actions_tensor_.shape)
@@ -388,6 +446,9 @@ if __name__ == "__main__":
     for c in range(num_channels):
         print(f"Channel {c}: min={mins[c]:.4f}, max={maxs[c]:.4f}, "
               f"mean={means[c]:.4f}, std={stds[c]:.4f}")
+        
+
+    print(actions_tensor[0])
     print("doing scale") 
     
     actions_tensor = actions_tensor_
