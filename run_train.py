@@ -17,6 +17,7 @@ from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 from wan.modules.model import WanModel
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
+from wan.dataset.openvid_dataset import DatasetFromCSV
 from wan.dataset.test_dataset import OneShotVideoDataset
 from wan.utils.train_utils import encode_video_and_text, load_weights, random_drop
 from wan.modules.clip import ClipImageEncoder
@@ -82,24 +83,47 @@ def main():
     ps_t, ps_h, ps_w = args.patch_size
 
     # Demo dataset
-    video_path = "/home/rapverse/workspace_junzhi/datasets_ckpts/train/367-648961-000/head_color.mp4"
-    prompt_text = [
-        "POV of a pair of junzhi robot arm are handling toast",
-        "POV of junzhi robot and it is handling toast",
-        "POV of a pair of junzhi robot gripper and it is handling toast",
-        "First person view of a junzhi brand robot gripper and it is handling toast",
-    ]
+    # video_path = "/home/rapverse/workspace_junzhi/datasets_ckpts/train/367-648961-000/head_color.mp4"
+    # prompt_text = [
+    #     "POV of a pair of junzhi robot arm are handling toast",
+    #     "POV of junzhi robot and it is handling toast",
+    #     "POV of a pair of junzhi robot gripper and it is handling toast",
+    #     "First person view of a junzhi brand robot gripper and it is handling toast",
+    # ]
 
-    dataset = OneShotVideoDataset(video_path=video_path, text=prompt_text)
+    # dataset = OneShotVideoDataset(video_path=video_path, text=prompt_text)
+    # def collate_fn(batch):
+    #     videos, texts, imgs = zip(*batch)
+    #     return list(videos), list(texts), list(imgs)
+
+    # dataloader = DataLoader(
+    #     dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=True,
+    #     num_workers=16,
+    #     pin_memory=True,
+    #     collate_fn=collate_fn
+    # )
+
+    data_path = '/mnt/data-oss/openvid/data/train/OpenVid-1M.csv'
+    root='/mnt/data-oss/openvid/video'
+
+    dataset = DatasetFromCSV(
+        data_path,
+        target_frames=args.frame_num,
+        target_h=H,
+        target_w=W,
+        root=root,
+    )
     def collate_fn(batch):
-        videos, texts, imgs = zip(*batch)
-        return list(videos), list(texts), list(imgs)
-
+        video_tensors = [item[0] for item in batch]   # list of video tensors
+        texts = [item[1] for item in batch]           # list of strings
+        return video_tensors, texts
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=16,
+        num_workers=4,
         pin_memory=True,
         collate_fn=collate_fn
     )
@@ -175,7 +199,7 @@ def main():
         num_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            videos, texts, imgs = batch
+            videos, texts = batch
             B = len(videos)
             if B == 0:
                 continue
@@ -184,7 +208,6 @@ def main():
             with torch.no_grad():
                 latents, context, img_latents, clip_feat = encode_video_and_text(
                     videos=videos,
-                    imgs=imgs,
                     texts=texts,
                     vae=vae,
                     text_encoder=text_encoder,

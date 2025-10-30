@@ -1,6 +1,6 @@
 import torch
 
-ckpt_path = "/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10271814/ds_step_100/global_step_100/mp_rank_00_model_states.pt"
+ckpt_path = "/home/rapverse/workspace_junzhi/Simple-Wan2.1/exp/exp_ds_10290127/ds_step_2040/global_step_2040/mp_rank_00_model_states.pt"
 state_dict = torch.load(ckpt_path, map_location="cpu")
 
 model_state = state_dict.get('module', {})

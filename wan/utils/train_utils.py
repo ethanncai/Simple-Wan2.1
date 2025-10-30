@@ -15,6 +15,39 @@ import numpy as np
 import cv2
 from decord import VideoReader, cpu
 
+import subprocess
+import json
+
+def get_video_info(video_path: str):
+    """
+    使用 ffprobe 获取视频的元信息，不解码视频帧
+    """
+    cmd = [
+        "ffprobe",
+        "-v", "error",                     # 只输出错误信息
+        "-select_streams", "v:0",          # 只选择视频流
+        "-show_entries", "stream=width,height,nb_frames,duration,avg_frame_rate",
+        "-of", "json",                     # 输出为 JSON 格式
+        video_path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    info = json.loads(result.stdout)
+    
+    if not info["streams"]:
+        raise ValueError("未检测到视频流")
+
+    stream = info["streams"][0]
+    fps = eval(stream.get("avg_frame_rate", "0")) if stream.get("avg_frame_rate") != "0/0" else 0
+    frames = int(stream["nb_frames"]) if stream.get("nb_frames", "0").isdigit() else None
+
+    return {
+        "width": int(stream.get("width", 0)),
+        "height": int(stream.get("height", 0)),
+        "duration": float(stream.get("duration", 0.0)),
+        "fps": fps,
+        "frames": frames
+    }
+
 def video_to_cthw(video_path):
     vr = VideoReader(video_path, ctx=cpu(0))
     total_frames = len(vr)
@@ -278,7 +311,6 @@ def print_gpu_memory(prefix):
 
 def encode_video_and_text(
     videos: List[torch.Tensor],
-    imgs: List[torch.Tensor],
     texts: List[str],
     vae,
     text_encoder,
@@ -294,8 +326,10 @@ def encode_video_and_text(
     # ======================
     # VAE Encoding
     # ======================
+    imgs = [v[:,:1,...] for v in videos] # img -> [C1HW,]
+
     videos_on_device = [v.to(device) for v in videos]
-    imgs_on_device = [v.unsqueeze(1).to(device) for v in imgs]
+    imgs_on_device = [v.to(device) for v in imgs]
     imgs_on_device = [v.repeat(1,4,1,1) for v in imgs_on_device]
     assert videos_on_device[0].dtype == imgs_on_device[0].dtype
     if debug: print_gpu_memory('before moving vae to gpu')

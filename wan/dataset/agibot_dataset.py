@@ -9,12 +9,13 @@ import json
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import ipdb
-from ..utils.train_utils import video_to_cthw, cthw_to_video,resize_but_retain_ratio
+from ..utils.train_utils import video_to_cthw, cthw_to_video,resize_but_retain_ratio,get_video_info
 import torch
 import torch.nn.functional as F
 from pathlib import Path
 import pickle
-class DatasetFromCSV(torch.utils.data.Dataset):
+
+class AgibotDataset(torch.utils.data.Dataset):
     """load video according to the csv file.
 
     Args:
@@ -28,52 +29,42 @@ class DatasetFromCSV(torch.utils.data.Dataset):
         csv_path,
         target_w,
         target_h,
-        target_frames=16,
+        target_frames=81,
+        sample_interval=6, # means slow down 6x
         tries=10000,
-        root=None,
+        agibot_dataset_path=None,
+        agibot_task_info_path=None,
+        
     ):
+        # 这个类只在加载的时候进行完整性检查。indexing的时候不对样本是否corrupt进行检查
         self.tries =tries
         self.target_frames = target_frames
         self.target_h = target_h
         self.target_w = target_w
-        self.root = root
+        self.agibot_dataset_path = agibot_dataset_path
+        self.agibot_task_info_path = agibot_task_info_path
         self.T5_MAX_LEN = 512
+        self.raw_frame_required = self.target_frames * sample_interval
 
-        cache_file = Path(csv_path).with_suffix(".csv.cached")
-        csv_mtime = os.path.getmtime(csv_path)
-
-        if cache_file.exists():
-            with open(cache_file, "rb") as f:
-                cached_mtime, video_samples = pickle.load(f)
-            if cached_mtime == csv_mtime:
-                print(f"[Dataset] Loading cache {cache_file}")
-                self.samples = video_samples
-                return
-            else:
-                print(f"[Dataset] Cache not found")
-
-        print("[Dataset] Reading CSV...")
-        video_samples = []
-        with open(csv_path, "r") as f:
-            reader = csv.reader(f)
-            next(reader, None)       
-            for vid in reader:
-                vid_name, vid_caption = vid[0], vid[1]
-                vid_path = os.path.join(self.root, vid_name)
-                if os.path.exists(vid_path):
-                    video_samples.append([vid_path, vid_caption])
-        print("[Dataset] Done Reading CSV.")
-
-        # 写缓存
-        with open(cache_file, "wb") as f:
-            pickle.dump((csv_mtime, video_samples), f)
-        print(f"[Dataset] Cache created {cache_file}")
-        self.samples = video_samples
+        print("[Dataset] Indexing Dataset...")
+        self.sample_paths = list(os.listdir(self.agibot_dataset_path))
 
     def getitem(self, index):
-        sample = self.samples[index]
-        video_path = sample[0]
-        text = sample[1]
+        sample_dir_name = self.samples[index]
+        sample_dir_path = os.path.join(self.agibot_dataset_path, sample_dir_name)
+        
+        video_path = os.path.join(sample_dir_path,
+                                    "head_color.mp4")
+        ex_json_path = os.path.join(sample_dir_path,
+                                    "head_extrinsic_params_aligned.json")
+        in_json_path = os.path.join(sample_dir_path,
+                                    "head_intrinsic_params.json")
+        h5_json_path = os.path.join(sample_dir_path,
+                                    "proprio_stats.h5")
+
+
+        video_path = sample_dir_name[0]
+        text = sample_dir_name[1]
         video_cthw = video_to_cthw(video_path)
         _,T,H,W = video_cthw.shape
         
@@ -117,6 +108,46 @@ class DatasetFromCSV(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.samples)
+    
+    def get_caption(self, index):
+        pass
+
+    @staticmethod
+    def get_task_n_episode_id(sample_dir_name):
+        assert len(sample_dir_name) == 12, f"Sample name len error"
+        parts = sample_dir_name.split('-')
+        assert len(parts) == 3, f"Sample name format error"
+        task_str, episode_str, segment_str = parts
+        return parts
+
+    def make_video_path(self, task_str, episode_str, segment_str):
+        video_path = os.path.join(
+            self.agibot_dataset_path,
+            f"{task_str}-{episode_str}-{segment_str}"
+        )
+        return video_path
+    
+    def get_video_path(self, sample_dir_name):
+        video_path = os.path.join(
+            self.agibot_dataset_path,
+            sample_dir_name
+        )
+        return video_path
+
+    def get_global_raw_frame_index(self, task_str, episode_str, target_segment_str):
+        global_frame_start = 0
+        for seg in range(int(target_segment_str)):
+            info_dict = get_video_info(self.make_video_path(task_str, episode_str, seg))
+            global_frame_start += info_dict['frames']
+        info_dict_ = get_video_info(self.make_video_path(task_str, episode_str, target_segment_str))
+        global_frame_end = info_dict_['frames']
+        
+        # trimed to reduce some marginal bug
+        global_frame_start += 1
+        global_frame_end -= 1
+
+        return global_frame_start, global_frame_end
+
 
 
 if __name__ == '__main__':
@@ -126,12 +157,12 @@ if __name__ == '__main__':
     data_path = '/mnt/data-oss/openvid/data/train/OpenVid-1M.csv'
     root='/mnt/data-oss/openvid/video'
 
-    dataset = DatasetFromCSV(
+    dataset = AgibotDataset(
         data_path,
         target_frames=81,
         target_h=480,
         target_w=832,
-        root=root,
+        agibot_dataset_path=root,
     )
 
     def collate_fn(batch):

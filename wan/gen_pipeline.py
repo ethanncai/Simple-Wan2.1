@@ -69,7 +69,7 @@ class GenPipeline:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
         self.model = WanModel()
-        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Wan2.1/exp/exp_ds_10280352/ds_step_60')
+        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Simple-Wan2.1/exp/exp_ds_10290127/ds_step_2040')
 
         # 3. 加载到模型（strict=False 可跳过不匹配的键，比如 head 不同）
         # self.model.load_state_dict(state_dict, strict=True)
@@ -165,6 +165,8 @@ class GenPipeline:
                 generator=seed_g
             )
         ]
+
+        print(f"[GenPipline] Latent shape: {noise[0].shape}")
 
         @contextmanager
         def noop():
