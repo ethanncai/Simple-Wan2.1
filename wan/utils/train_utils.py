@@ -95,6 +95,20 @@ def cthw_to_video(video_tensor: torch.Tensor,
                 output_params=['-crf', str(crf),
                                '-preset', 'medium'])
 
+def stretchly_resize(clip, target_size):
+    C, T, H_in, W_in = clip.shape
+    H_out, W_out = target_size
+    
+    # 将 (C, T, H, W) 重排为 (T, C, H, W) 以便 interpolate 处理
+    clip = clip.permute(1, 0, 2, 3)  # (T, C, H_in, W_in)
+    
+    # 使用 interpolate 进行 resize，mode='bilinear' 适用于图像
+    resized_clip = F.interpolate(clip, size=(H_out, W_out), mode='bilinear', align_corners=False)
+    
+    # 恢复原始维度顺序 (C, T, H_out, W_out)
+    resized_clip = resized_clip.permute(1, 0, 2, 3)
+    
+    return resized_clip
 
 def resize_but_retain_ratio(clip, target_size):
     """
