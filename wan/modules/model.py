@@ -310,44 +310,6 @@ class WanAttentionBlock(nn.Module):
         x = cross_attn_ffn(x, context, context_lens, e)
         return x
 
-class ImageConditionedBlock(WanAttentionBlock):
-    def __init__(self,
-                 dim,
-                 ffn_dim,
-                 num_heads,
-                 window_size=(-1, -1),
-                 qk_norm=True,
-                 cross_attn_norm=False,
-                 eps=1e-6):
-        # 调用父类初始化（WanAttentionBlock）
-        super().__init__(
-            dim=dim,
-            ffn_dim=ffn_dim,
-            num_heads=num_heads,
-            window_size=window_size,
-            qk_norm=qk_norm,
-            cross_attn_norm=cross_attn_norm,
-            eps=eps
-        )
-        # 只新增 alpha 参数
-        self.alpha = nn.Parameter(torch.tensor(1e-3))
-
-    def forward(
-        self,
-        x,
-        e,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        context,
-        context_lens,
-    ):
-        x_in = x.clone()
-        # 调用父类的完整计算逻辑（self-attn + cross-attn + FFN）
-        x = super().forward(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
-        # 添加带 alpha 的残差连接
-        return x_in + self.alpha * x
-
 class Head(nn.Module):
 
     def __init__(self, dim, out_dim, patch_size, eps=1e-6):
@@ -463,6 +425,9 @@ class WanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
+        # alpha
+        self.alpha = nn.Parameter(torch.tensor(1e-3))
+
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -485,13 +450,13 @@ class WanModel(ModelMixin, ConfigMixin):
             for _ in range(num_layers)
         ])
 
-        self.img_conditioned_blocks = nn.ModuleList([
-            ImageConditionedBlock(dim, ffn_dim, num_heads,
+        self.i2v_blocks = nn.ModuleList([
+            WanAttentionBlock(dim, ffn_dim, num_heads,
                               window_size, qk_norm, cross_attn_norm, eps)
             for _ in range(num_img_conditioned_layers)
         ])
 
-        self.transformer_block_lists = [self.blocks, self.img_conditioned_blocks]
+        self.transformer_block_lists = [self.blocks, self.i2v_blocks]
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
 
@@ -618,9 +583,10 @@ class WanModel(ModelMixin, ConfigMixin):
                 kwargs['context_lens'],
                 use_reentrant=False
             )
+            x_ = None
             if i % img_moduli == 0:
-                x = grad_checkpoint(
-                    self.img_conditioned_blocks[i // img_moduli],
+                x_ = grad_checkpoint(
+                    self.i2v_blocks[i // img_moduli],
                     x,
                     kwargs['e'],
                     kwargs['seq_lens'],
@@ -630,6 +596,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     kwargs['clip_lens'],
                     use_reentrant=False
                 )
+            x = x if x_ is None else x + self.alpha * x_
         x = self.head(x, e)
 
         # unpatchify

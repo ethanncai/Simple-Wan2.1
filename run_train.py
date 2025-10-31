@@ -50,7 +50,7 @@ def parse_args():
 
     # accept local_rank injected by DeepSpeed
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank passed by DeepSpeed/torchrun")
-
+    parser.add_argument("--alpha_significance_step", type=int, default=10000, help="Control alpha loss to make it close to zero")
     return parser.parse_args()
 
 
@@ -264,7 +264,10 @@ def main():
                 else:
                     velocity_pred = velocity_pred_list
 
-                loss = F.mse_loss(velocity_pred, target)
+                alpha = ds_engine.module.alpha
+                alpha_loss = F.mse_loss(alpha, alpha.new_ones(alpha.shape))
+                alpha_significance = global_step / args.alpha_significance_step
+                loss = F.mse_loss(velocity_pred, target) + alpha_significance * alpha_loss
 
             ds_engine.backward(loss)
             ds_engine.step()
@@ -276,19 +279,11 @@ def main():
 
             # --- logging by global step ---
             if is_rank0 and (global_step % args.log_every == 0):
-                writer.add_scalar("Loss/train", loss_val, global_step)
-                print(f"[Step {global_step}] Loss: {loss_val:.6f}")
-                alphas = []
-                for block in ds_engine.module.img_conditioned_blocks:
-                    alpha_val = block.alpha.item() if hasattr(block, 'alpha') else 0.0
-                    alphas.append(alpha_val)
-                
-                if alphas:
-                    avg_alpha = sum(alphas) / len(alphas)
-                    writer.add_scalar("Alpha/mean", avg_alpha, global_step)
-                    writer.add_scalar("Alpha/min", min(alphas), global_step)
-                    writer.add_scalar("Alpha/max", max(alphas), global_step)
-                    print(f"[Step {global_step}] Alpha: mean={avg_alpha:.6f}, min={min(alphas):.6f}, max={max(alphas):.6f}")
+                writer.add_scalar("Loss/train", loss.item(), global_step)
+                print(f"[Step {global_step}] Loss: {loss.item():.6f}")
+                alpha_value = ds_engine.module.alpha.item()  # 注意：应该是 i2v_alpha 而不是 alpha
+                writer.add_scalar("Alpha", alpha_value, global_step)
+                print(f"[Step {global_step}] Alpha: {alpha_value:.6f}")
 
             # --- checkpoint save by global step ---
             if global_step % args.save_every == 0:
