@@ -206,7 +206,7 @@ def get_action_with_vp(h5_path,in_json_path,ex_json_path, resolution=(480, 640),
     # 4. Remove the view dimension (V=1) → (C, T, H, W)
     vp_traj = traj_ctvhw.squeeze(1)  # Now (3, T, 720, 1280)
 
-    return transformed_action, torch.tensor(vp_traj.clone(),dtype=float)
+    return transformed_action, vp_traj.clone().detach().to(dtype=torch.float)
 
 
 

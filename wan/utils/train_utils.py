@@ -33,8 +33,9 @@ def get_video_info(video_path: str):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     info = json.loads(result.stdout)
     
+    assert "streams" in info, f"未检测到视频流 in {video_path}"
     if not info["streams"]:
-        raise ValueError("未检测到视频流")
+        raise ValueError(f"未检测到视频流 in {video_path}")
 
     stream = info["streams"][0]
     fps = eval(stream.get("avg_frame_rate", "0")) if stream.get("avg_frame_rate") != "0/0" else 0
