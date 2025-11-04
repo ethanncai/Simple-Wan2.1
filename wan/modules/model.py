@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-
+from typing import Optional
 import torch
 from torch import amp as amp
 import torch.nn as nn
@@ -8,8 +8,9 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from ..utils.train_utils import compute_dispersion_moduli
-from .attention import flash_attention
-
+from .attention import flash_attention, attention
+from .resampler import ActionResampler
+# from .fw_attn import FrameWiseCrossAttention
 __all__ = ['WanModel']
 
 T5_CONTEXT_TOKEN_NUMBER = 512
@@ -203,30 +204,110 @@ class WanCrossAttention(WanSelfAttention):
         x = self.o(x)  # zero-init -> short-circuited initially
         return x
 
+class FrameWiseCrossAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size=(-1, -1),
+        qk_norm=True,
+        tokens_per_frame=None,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        dropout: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        dtype: torch.dtype = torch.bfloat16,
+        use_fw_pos_embed: bool = True,  # 新增开关
+        eps=1e-6
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.tokens_per_frame = tokens_per_frame
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim must be divisible by num_heads"
 
-# class I2VExtensionBlock(nn.Module):
-#     def __init__(self,
-#                  alpha_init=0.6):  # 初始短路比例
-#         super().__init__()
-#         # alpha for residual short-circuit
-#         self.alpha = nn.Parameter(torch.tensor(alpha_init), requires_grad=True)
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.out_proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.dropout = dropout
+        self.softmax_scale = softmax_scale if softmax_scale is not None else (self.head_dim ** -0.5)
+        self.dtype = dtype
+        self.use_pos_embed = use_fw_pos_embed
+        self.norm1 = WanLayerNorm(dim, eps)
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
+                                          eps)
 
-#     def forward(
-#             self, 
-#             x,
-#             img ):
-#         x_in = x 
-#         if img is not None:
-#             B, L, C = x.shape
-#             _, L_prime, _ = img.shape
-#             assert L_prime <= L and L % L_prime == 0
-#             x = x.clone()  # 或者 x = x.detach().clone()
-#             x[:, :L_prime, :] = img
+        if use_fw_pos_embed:
+            self.pos_embed = nn.Parameter(torch.zeros(tokens_per_frame, dim))
+            nn.init.normal_(self.pos_embed, std=0.02)
+        else:
+            self.pos_embed = None
 
-#         x = (1-self.alpha) * x_in + self.alpha * x
-#         return x
+    def forward(
+        self,
+        x: torch.Tensor,  # [B, N, dim], N = T * tokens_per_frame
+        e,
+        action: torch.Tensor,  # [B, T, dim]
+        seq_lens,
+        grid_sizes,
+        freqs,
+    ) -> torch.Tensor:
+        B, N, dim = x.shape
+        T = action.shape[1]
+        assert N == T * self.tokens_per_frame
 
-    
+        # === 添加位置编码 ===
+        if self.use_pos_embed:
+            # x: [B, T, tokens_per_frame, dim]
+            x = x.view(B, T, self.tokens_per_frame, dim)
+            # 广播 pos_embed [tokens_per_frame, dim] -> [B, T, tokens_per_frame, dim]
+            x = x + self.pos_embed.unsqueeze(0).unsqueeze(0)
+            x = x.view(B, N, dim)
+
+        # Project
+        q = self.q_proj(x)   # [B, N, dim]
+        k = self.k_proj(action)   # [B, T, dim]
+        v = self.v_proj(action)   # [B, T, dim]
+
+        # Reshape to per-frame: [B*T, Lq, dim] and [B*T, Lk=1, dim]
+        q = q.view(B, T, self.tokens_per_frame, dim).view(B * T, self.tokens_per_frame, dim)
+        k = k.view(B * T, 1, dim)
+        v = v.view(B * T, 1, dim)
+
+        # Multi-head: [B*T, L, num_heads, head_dim]
+        q = q.view(B * T, self.tokens_per_frame, self.num_heads, self.head_dim)
+        k = k.view(B * T, 1, self.num_heads, self.head_dim)
+        v = v.view(B * T, 1, self.num_heads, self.head_dim)
+
+        # Call attention
+        out = attention(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=self.dropout,
+            softmax_scale=self.softmax_scale,
+            dtype=self.dtype,
+        )  # [B*T, tokens_per_frame, num_heads, head_dim]
+
+        # Reshape back to [B, N, dim]
+        x = x.view(B, T, self.tokens_per_frame, self.dim).view(B, N, self.dim)
+        x = self.out_proj(x)
+        e = e.clone()
+        assert e.dtype == torch.float32
+        with amp.autocast("cuda", dtype=torch.float32):
+            e = (self.modulation + e).chunk(6, dim=1)
+        assert e[0].dtype == torch.float32
+
+        # self-attention
+        norm1x = self.norm1(x)
+        sa_inp = norm1x * (1 + e[1].to(norm1x.dtype)) + e[0].to(norm1x.dtype)
+        y = self.self_attn(sa_inp, seq_lens, grid_sizes, freqs)
+        x = x + (y.to(x.dtype) * e[2].to(x.dtype))
+        return x
+
 class WanAttentionBlock(nn.Module):
 
     def __init__(self,
@@ -354,6 +435,9 @@ class WanModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self,
                 #  model_type='t2v',
+                 target_latent_w = 208,
+                 target_latent_h = 120,
+                 target_latent_t = 21,
                  patch_size=(1, 2, 2),
                  text_len=512,
                  in_dim=16,
@@ -361,6 +445,7 @@ class WanModel(ModelMixin, ConfigMixin):
                  ffn_dim=8960,
                  freq_dim=256,
                  text_dim=4096,
+                 action_dim=16,
                  out_dim=16,
                  num_heads=12,
                  num_layers=30,
@@ -417,6 +502,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.ffn_dim = ffn_dim
         self.freq_dim = freq_dim
         self.text_dim = text_dim
+        self.action_dim = action_dim
         self.out_dim = out_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
@@ -424,6 +510,15 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+
+        # precalculate the shape related params
+
+        assert patch_size[0] == 1, "we currently only handle time patch stride == 1"
+        target_w_patches = target_latent_w // patch_size[2]
+        target_h_patches = target_latent_h // patch_size[1]
+        self.tokens_per_frame = target_w_patches * target_h_patches
+
+        self.grid_size = torch.tensor([target_latent_t, target_h_patches, target_w_patches])
 
         # alpha
         self.alpha = nn.Parameter(torch.tensor(1e-3))
@@ -441,22 +536,28 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # clip projection
         CLIP_DIM = 768
+        VAE_T_RATIO = 4
         self.projector = nn.Linear(CLIP_DIM, dim, bias=True)
+
+        self.action_resampler = ActionResampler(
+            action_dim=self.action_dim,
+            dim=self.dim,
+            downsample_ratio=VAE_T_RATIO) # B,T_pixle,action_dim -> B, T_latent,dim
 
         # blocks
         self.blocks = nn.ModuleList([
-            WanAttentionBlock(dim, ffn_dim, num_heads,
-                              window_size, qk_norm, cross_attn_norm, eps)
+            WanAttentionBlock(dim=dim, ffn_dim=ffn_dim, num_heads=num_heads,
+                              window_size=window_size, qk_norm=qk_norm, cross_attn_norm=cross_attn_norm, eps=eps)
             for _ in range(num_layers)
         ])
 
-        self.i2v_blocks = nn.ModuleList([
-            WanAttentionBlock(dim, ffn_dim, num_heads,
-                              window_size, qk_norm, cross_attn_norm, eps)
+        self.action_blocks = nn.ModuleList([
+            FrameWiseCrossAttention(dim=dim, num_heads=num_heads,
+                              window_size=window_size, qk_norm=qk_norm, tokens_per_frame=self.tokens_per_frame,eps=eps)
             for _ in range(num_img_conditioned_layers)
         ])
 
-        self.transformer_block_lists = [self.blocks, self.i2v_blocks]
+        self.transformer_block_lists = [self.blocks, self.action_blocks]
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
 
@@ -483,6 +584,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         img_latent=None,
         clip_feat=None,
+        action=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -500,7 +602,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 Maximum sequence length for positional encoding
             clip_fea (Tensor, *optional*):
                 CLIP image features for image-to-video mode or first-last-frame-to-video mode
-
+            action (Tensor, [B, L, action_dim])
         Returns:
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
@@ -508,6 +610,13 @@ class WanModel(ModelMixin, ConfigMixin):
         # if self.model_type == 'i2v' or self.model_type == 'flf2v':
         #     assert clip_fea is not None and y is not None
         # params
+
+        # process action
+        assert len(x) == len(img_latent) and len(x) == len(context), "inconsists len"
+        B = len(x)
+        action = torch.stack(action) # batchify to B, raw_frame, dim
+        action_aligned = self.action_resampler(action) # (B,T_pixle,action_dim) -> (B, T_latent,dim)
+
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
@@ -521,9 +630,6 @@ class WanModel(ModelMixin, ConfigMixin):
         x = x_
             
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        
-        grid_sizes = torch.stack(
-            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
@@ -555,16 +661,19 @@ class WanModel(ModelMixin, ConfigMixin):
             # context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
             # context_iv = torch.concat([context_clip, context], dim=1)
 
+        grid_sizes = self.grid_size.unsqueeze(0).repeat(B,1)
+
         # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
-            grid_sizes=grid_sizes,
+            grid_sizes=grid_sizes, # [latent_t, h_patches, w_patches]
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
             clip_feat=clip_feat, # B,dim
-            clip_lens=clip_lens
+            clip_lens=clip_lens,
+            action=action_aligned
             )
         
         # altering_forward = create_alternating_forward(self.blocks, self.i2v_extension_blocks, grad_checkpoint=grad_checkpoint)
@@ -586,14 +695,13 @@ class WanModel(ModelMixin, ConfigMixin):
             x_ = None
             if i % img_moduli == 0:
                 x_ = grad_checkpoint(
-                    self.i2v_blocks[i // img_moduli],
+                    self.action_blocks[i // img_moduli],
                     x,
                     kwargs['e'],
+                    kwargs['action'],
                     kwargs['seq_lens'],
                     kwargs['grid_sizes'],
                     kwargs['freqs'],
-                    kwargs['clip_feat'],
-                    kwargs['clip_lens'],
                     use_reentrant=False
                 )
             x = x if x_ is None else x + self.alpha * x_
@@ -664,15 +772,23 @@ def test_wan_model():
     num_heads = 4  # Number of attention heads
     num_layers = 30  # Number of transformer layers
     text_dim = 4096  # Text embedding dimension
-    frames = 8  # Number of frames
-    height = 32  # Frame height
-    width = 32   # Frame width
+    frames = 21  # Number of frames
+    height = 120  # Frame height
+    width = 208   # Frame width
     patch_size = (1, 2, 2)  # Temporal and spatial patch sizes
     text_len = 77  # Maximum text tokens
     freq_dim = 256  # Time embedding dimension
+    action_dim = 16
+    raw_action_frame = 81
+    target_latent_w = width
+    target_latent_h = height
+    target_latent_t = frames
     
     # Create the model - test with t2v mode
     model = WanModel(
+        target_latent_w = target_latent_w,
+        target_latent_h = target_latent_h,
+        target_latent_t = target_latent_t,
         patch_size=patch_size,
         text_len=text_len,
         in_dim=in_dim,
@@ -690,6 +806,7 @@ def test_wan_model():
     
     # Generate random input data
     x = [torch.randn(in_dim, frames, height, width).to('cuda') for _ in range(batch_size)]
+    action = [torch.randn(raw_action_frame,action_dim).to('cuda') for _ in range(batch_size)]
     img = [torch.randn(in_dim,1, height, width).to('cuda') for _ in range(batch_size)]
     t = torch.randint(0, 1000, (batch_size,)).to('cuda')
     clip_feat = torch.randn([batch_size,768]).to('cuda') 
@@ -703,7 +820,7 @@ def test_wan_model():
     
     # Run forward pass
     with torch.no_grad():
-        outputs = model(x, t, context, seq_len,img_latent=img,clip_feat=clip_feat)
+        outputs = model(x, t, context, seq_len,img_latent=img,clip_feat=clip_feat,action=action)
     
     # Check output shape
     expected_f = frames
