@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 import deepspeed
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
-
+from wan.dataset.agibot_dataset import AgibotDataset
 from wan.modules.model import WanModel
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae import WanVAE
@@ -50,7 +50,8 @@ def parse_args():
 
     # accept local_rank injected by DeepSpeed
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank passed by DeepSpeed/torchrun")
-    parser.add_argument("--alpha_significance_step", type=int, default=10000, help="Control alpha loss to make it close to zero")
+    parser.add_argument("--alpha_loss", type=bool, default=False, help="Control alpha loss to make it close to zero")
+    parser.add_argument("--alpha_significance_step", type=int, default=100000, help="Control alpha loss to make it close to zero")
     return parser.parse_args()
 
 
@@ -105,20 +106,41 @@ def main():
     #     collate_fn=collate_fn
     # )
 
-    data_path = '/mnt/data-oss/openvid/data/train/OpenVid-1M.csv'
-    root='/mnt/data-oss/openvid/video'
+    # data_path = '/mnt/data-oss/openvid/data/train/OpenVid-1M.csv'
+    # root='/mnt/data-oss/openvid/video'
 
-    dataset = DatasetFromCSV(
-        data_path,
-        target_frames=args.frame_num,
-        target_h=H,
-        target_w=W,
-        root=root,
+    # dataset = DatasetFromCSV(
+    #     data_path,
+    #     target_frames=args.frame_num,
+    #     target_h=H,
+    #     target_w=W,
+    #     root=root,
+    # )
+    agibot_dataset_path = '/home/rapverse/workspace_junzhi/datasets_ckpts/train'
+    agi_taskinfo_path = '/mnt/data-oss/rap-prod-bak/AgibotWorld-Beta/task_info'
+
+    dataset = AgibotDataset(
+        target_frames=81,
+        sample_interval=6,
+        target_h=480,
+        target_w=832,
+        agibot_dataset_path=agibot_dataset_path,
+        agibot_task_info_path=agi_taskinfo_path,
+        return_vp=False
     )
+
     def collate_fn(batch):
         video_tensors = [item[0] for item in batch]   # list of video tensors
-        texts = [item[1] for item in batch]           # list of strings
-        return video_tensors, texts
+        actions = [item[1] for item in batch]           # list of tensors
+        texts = [item[2] for item in batch]           # list of strings
+        vps = [item[3] for item in batch]   
+        return video_tensors, texts, actions, vps
+
+
+    # def collate_fn(batch):
+    #     video_tensors = [item[0] for item in batch]   # list of video tensors
+    #     texts = [item[1] for item in batch]           # list of strings
+        # return video_tensors, texts
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -199,7 +221,7 @@ def main():
         num_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            videos, texts = batch
+            videos, texts, actions, _ = batch
             B = len(videos)
             if B == 0:
                 continue
@@ -216,7 +238,7 @@ def main():
                     param_dtype=torch.bfloat16
                 )
                 # img_latents = random_drop(img_latents, drop_prob=args.cfg_drop_prob)
-
+            actions = [a.to(device, dtype=param_dtype) for a in actions]
             img_latents = torch.stack(img_latents, dim=0).to(device, dtype=param_dtype)
             assert img_latents.shape[2] == 1
             
@@ -257,7 +279,8 @@ def main():
                                                 context=context,
                                                 seq_len=seq_len, 
                                                 img_latent=img_latents,
-                                                clip_feat=clip_feat)
+                                                clip_feat=clip_feat,
+                                                action=actions)
                 
                 if isinstance(velocity_pred_list, (list, tuple)):
                     velocity_pred = torch.stack(velocity_pred_list, dim=0)
@@ -267,7 +290,10 @@ def main():
                 alpha = ds_engine.module.alpha
                 alpha_loss = F.mse_loss(alpha, alpha.new_ones(alpha.shape))
                 alpha_significance = global_step / args.alpha_significance_step
-                loss = F.mse_loss(velocity_pred, target) + alpha_significance * alpha_loss
+                if args.alpha_loss:
+                    loss = F.mse_loss(velocity_pred, target) + alpha_significance * alpha_loss
+                else:
+                    loss = F.mse_loss(velocity_pred, target)
 
             ds_engine.backward(loss)
             ds_engine.step()

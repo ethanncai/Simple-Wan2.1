@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 import math
 
-def _sinusoidal_positional_encoding(T, dim, device, max_period=10000):
-    pe = torch.zeros(T, dim, device=device)
-    position = torch.arange(0, T, dtype=torch.float32, device=device).unsqueeze(1)
+def _sinusoidal_positional_encoding(T, dim, device, dtype=torch.float32, max_period=10000):
+    pe = torch.zeros(T, dim, device=device, dtype=dtype)
+    position = torch.arange(0, T, dtype=dtype, device=device).unsqueeze(1)
     div_term = torch.exp(
-        torch.arange(0, dim, 2, dtype=torch.float32, device=device) *
+        torch.arange(0, dim, 2, dtype=dtype, device=device) *
         (-math.log(float(max_period)) / dim)
     )
     pe[:, 0::2] = torch.sin(position * div_term)
@@ -47,11 +47,12 @@ class ActionResampler(nn.Module):
         T_out = max(1, (T + self.downsample_ratio - 1) // self.downsample_ratio)
 
         x = self.input_proj(x)  # (B, T, dim)
-        # 加位置编码（从 x 获取 device）
-        x = x + _sinusoidal_positional_encoding(T, self.dim, x.device).unsqueeze(0)
+        # 使用与 x 相同的 dtype
+        pos_enc = _sinusoidal_positional_encoding(T, self.dim, x.device, dtype=x.dtype)
+        x = x + pos_enc.unsqueeze(0)
 
         base_latent = self.latent_token.expand(B, T_out, -1)
-        latent_pos = _sinusoidal_positional_encoding(T_out, self.dim, x.device).unsqueeze(0)
+        latent_pos = _sinusoidal_positional_encoding(T_out, self.dim, x.device, dtype=x.dtype).unsqueeze(0)
         query = base_latent + latent_pos
 
         x_norm = self.norm1(x)

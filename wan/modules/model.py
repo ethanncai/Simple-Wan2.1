@@ -259,15 +259,16 @@ class FrameWiseCrossAttention(nn.Module):
         T = action.shape[1]
         assert N == T * self.tokens_per_frame
 
-        # === 添加位置编码 ===
+        # === Save original input for residual ===
+        x_residual = x
+
+        # === Add position embedding (if enabled) ===
         if self.use_pos_embed:
-            # x: [B, T, tokens_per_frame, dim]
             x = x.view(B, T, self.tokens_per_frame, dim)
-            # 广播 pos_embed [tokens_per_frame, dim] -> [B, T, tokens_per_frame, dim]
             x = x + self.pos_embed.unsqueeze(0).unsqueeze(0)
             x = x.view(B, N, dim)
 
-        # Project
+        # === Project for cross-attention ===
         q = self.q_proj(x)   # [B, N, dim]
         k = self.k_proj(action)   # [B, T, dim]
         v = self.v_proj(action)   # [B, T, dim]
@@ -293,15 +294,19 @@ class FrameWiseCrossAttention(nn.Module):
         )  # [B*T, tokens_per_frame, num_heads, head_dim]
 
         # Reshape back to [B, N, dim]
-        x = x.view(B, T, self.tokens_per_frame, self.dim).view(B, N, self.dim)
-        x = self.out_proj(x)
+        out = out.reshape(B, T, self.tokens_per_frame, dim).reshape(B, N, dim)
+        cross_attn_out = self.out_proj(out)  # [B, N, dim]
+
+        # === Residual connection for cross-attention ===
+        x = x_residual + cross_attn_out
+
+        # === Apply modulation and self-attention ===
         e = e.clone()
         assert e.dtype == torch.float32
         with amp.autocast("cuda", dtype=torch.float32):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
-        # self-attention
         norm1x = self.norm1(x)
         sa_inp = norm1x * (1 + e[1].to(norm1x.dtype)) + e[0].to(norm1x.dtype)
         y = self.self_attn(sa_inp, seq_lens, grid_sizes, freqs)
@@ -435,8 +440,8 @@ class WanModel(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self,
                 #  model_type='t2v',
-                 target_latent_w = 208,
-                 target_latent_h = 120,
+                 target_latent_w = 104,
+                 target_latent_h = 60,
                  target_latent_t = 21,
                  patch_size=(1, 2, 2),
                  text_len=512,
@@ -449,7 +454,7 @@ class WanModel(ModelMixin, ConfigMixin):
                  out_dim=16,
                  num_heads=12,
                  num_layers=30,
-                 num_img_conditioned_layers=5,
+                 num_action_layers=15,
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=True,
@@ -554,7 +559,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.action_blocks = nn.ModuleList([
             FrameWiseCrossAttention(dim=dim, num_heads=num_heads,
                               window_size=window_size, qk_norm=qk_norm, tokens_per_frame=self.tokens_per_frame,eps=eps)
-            for _ in range(num_img_conditioned_layers)
+            for _ in range(num_action_layers)
         ])
 
         self.transformer_block_lists = [self.blocks, self.action_blocks]
@@ -679,7 +684,7 @@ class WanModel(ModelMixin, ConfigMixin):
         # altering_forward = create_alternating_forward(self.blocks, self.i2v_extension_blocks, grad_checkpoint=grad_checkpoint)
         block_moduli, img_moduli = self.moduli
         assert block_moduli == 1 # main block
-
+        # print(x.shape)
         for i in range(len(self.blocks)):
             x = grad_checkpoint(
                 self.blocks[i],
@@ -693,7 +698,8 @@ class WanModel(ModelMixin, ConfigMixin):
                 use_reentrant=False
             )
             x_ = None
-            if i % img_moduli == 0:
+            if i % img_moduli == 0 and i // img_moduli < len(self.action_blocks):
+                # print(f"triggered -> {i // img_moduli}")
                 x_ = grad_checkpoint(
                     self.action_blocks[i // img_moduli],
                     x,
@@ -705,6 +711,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     use_reentrant=False
                 )
             x = x if x_ is None else x + self.alpha * x_
+            # print(x.shape)
         x = self.head(x, e)
 
         # unpatchify
@@ -773,8 +780,8 @@ def test_wan_model():
     num_layers = 30  # Number of transformer layers
     text_dim = 4096  # Text embedding dimension
     frames = 21  # Number of frames
-    height = 120  # Frame height
-    width = 208   # Frame width
+    height = 80  # Frame height
+    width = 104   # Frame width
     patch_size = (1, 2, 2)  # Temporal and spatial patch sizes
     text_len = 77  # Maximum text tokens
     freq_dim = 256  # Time embedding dimension
@@ -785,21 +792,7 @@ def test_wan_model():
     target_latent_t = frames
     
     # Create the model - test with t2v mode
-    model = WanModel(
-        target_latent_w = target_latent_w,
-        target_latent_h = target_latent_h,
-        target_latent_t = target_latent_t,
-        patch_size=patch_size,
-        text_len=text_len,
-        in_dim=in_dim,
-        dim=dim,
-        ffn_dim=ffn_dim,
-        freq_dim=freq_dim,
-        text_dim=text_dim,
-        out_dim=out_dim,
-        num_heads=num_heads,
-        num_layers=num_layers
-    ).to('cuda')
+    model = WanModel().to('cuda')
     
     # Set to evaluation mode
     model.eval()

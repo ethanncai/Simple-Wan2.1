@@ -500,7 +500,7 @@ def compute_dispersion_moduli(block_lists: List[List]) -> List[int]:
         if L == 0:
             moduli.append(1)  # avoid div by zero; won't be used anyway
         else:
-            # 目标：大约每 (max_len / L) 步触发一次
+            # 目标：大约每 (max_len / L) 步触发一次, may be too much triggers
             m = max(1, round(max_len / L))
             moduli.append(m)
     return moduli
