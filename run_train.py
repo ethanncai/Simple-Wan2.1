@@ -29,6 +29,7 @@ def get_timestamp():
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Wan2.1 Text-to-Video Model (DeepSpeed ZeRO-2)")
     # core training args
+    parser.add_argument("--train_task", type=str, default="i2v", choices=["i2v", "ia2v"])
     parser.add_argument("--checkpoint_dir", type=str, default="/home/rapverse/workspace_junzhi/datasets_ckpts/Wan2.1-T2V-1.3B")
     parser.add_argument("--output_dir", type=str, default="exp")
     parser.add_argument("--log_dir", type=str, default="runs")
@@ -75,6 +76,7 @@ def main():
     args = parse_args()
 
     # dtype map
+    print(f"Training task: {args.train_task}")
     dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     param_dtype = dtype_map[args.param_dtype]
     t5_dtype = dtype_map[args.t5_dtype]
@@ -83,64 +85,47 @@ def main():
     W, H = map(int, args.size.split('*'))
     ps_t, ps_h, ps_w = args.patch_size
 
-    # Demo dataset
-    # video_path = "/home/rapverse/workspace_junzhi/datasets_ckpts/train/367-648961-000/head_color.mp4"
-    # prompt_text = [
-    #     "POV of a pair of junzhi robot arm are handling toast",
-    #     "POV of junzhi robot and it is handling toast",
-    #     "POV of a pair of junzhi robot gripper and it is handling toast",
-    #     "First person view of a junzhi brand robot gripper and it is handling toast",
-    # ]
+    # loaddataset
+    if args.train_task == "i2v":
+        
+        data_path = '/mnt/data-oss/openvid/data/train/OpenVid-1M.csv'
+        root='/mnt/data-oss/openvid/video'
+        dataset = DatasetFromCSV(
+            data_path,
+            target_frames=args.frame_num,
+            target_h=H,
+            target_w=W,
+            root=root,
+        )
+        def collate_fn(batch):
+            video_tensors = [item[0] for item in batch]   # list of video tensors
+            texts = [item[1] for item in batch]           # list of strings
+            return video_tensors, texts
+    
+    elif args.train_task == "ia2v":
+        
+        agibot_dataset_path = '/home/rapverse/workspace_junzhi/datasets_ckpts/train'
+        agi_taskinfo_path = '/mnt/data-oss/rap-prod-bak/AgibotWorld-Beta/task_info'
 
-    # dataset = OneShotVideoDataset(video_path=video_path, text=prompt_text)
-    # def collate_fn(batch):
-    #     videos, texts, imgs = zip(*batch)
-    #     return list(videos), list(texts), list(imgs)
+        dataset = AgibotDataset(
+            target_frames=81,
+            sample_interval=6,
+            target_h=480,
+            target_w=832,
+            agibot_dataset_path=agibot_dataset_path,
+            agibot_task_info_path=agi_taskinfo_path,
+            return_vp=False
+        )
 
-    # dataloader = DataLoader(
-    #     dataset,
-    #     batch_size=args.batch_size,
-    #     shuffle=True,
-    #     num_workers=16,
-    #     pin_memory=True,
-    #     collate_fn=collate_fn
-    # )
-
-    # data_path = '/mnt/data-oss/openvid/data/train/OpenVid-1M.csv'
-    # root='/mnt/data-oss/openvid/video'
-
-    # dataset = DatasetFromCSV(
-    #     data_path,
-    #     target_frames=args.frame_num,
-    #     target_h=H,
-    #     target_w=W,
-    #     root=root,
-    # )
-    agibot_dataset_path = '/home/rapverse/workspace_junzhi/datasets_ckpts/train'
-    agi_taskinfo_path = '/mnt/data-oss/rap-prod-bak/AgibotWorld-Beta/task_info'
-
-    dataset = AgibotDataset(
-        target_frames=81,
-        sample_interval=6,
-        target_h=480,
-        target_w=832,
-        agibot_dataset_path=agibot_dataset_path,
-        agibot_task_info_path=agi_taskinfo_path,
-        return_vp=False
-    )
-
-    def collate_fn(batch):
-        video_tensors = [item[0] for item in batch]   # list of video tensors
-        actions = [item[1] for item in batch]           # list of tensors
-        texts = [item[2] for item in batch]           # list of strings
-        vps = [item[3] for item in batch]   
-        return video_tensors, texts, actions, vps
+        def collate_fn(batch):
+            video_tensors = [item[0] for item in batch]   # list of video tensors
+            actions = [item[1] for item in batch]           # list of tensors
+            texts = [item[2] for item in batch]           # list of strings
+            vps = [item[3] for item in batch]   
+            return video_tensors, texts, actions, vps # vp may be None
 
 
-    # def collate_fn(batch):
-    #     video_tensors = [item[0] for item in batch]   # list of video tensors
-    #     texts = [item[1] for item in batch]           # list of strings
-        # return video_tensors, texts
+    
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -151,7 +136,7 @@ def main():
     )
 
     # Load model
-    model = WanModel()
+    model = WanModel(model_variation=args.train_task)
     load_weights(model,'/home/rapverse/workspace_junzhi/datasets_ckpts/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors')
     model.train()
 
@@ -221,7 +206,14 @@ def main():
         num_batches = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            videos, texts, actions, _ = batch
+            if args.train_task == "i2v":
+                try:
+                    videos, texts = batch
+                    actions = None
+                except:
+                    videos, texts, actions, _ = batch
+            elif args.train_task == "ia2v":
+                videos, texts, actions, _ = batch
             B = len(videos)
             if B == 0:
                 continue
@@ -238,7 +230,9 @@ def main():
                     param_dtype=torch.bfloat16
                 )
                 # img_latents = random_drop(img_latents, drop_prob=args.cfg_drop_prob)
-            actions = [a.to(device, dtype=param_dtype) for a in actions]
+            
+            if args.train_task == "ia2v":
+                actions = [a.to(device, dtype=param_dtype) for a in actions]
             img_latents = torch.stack(img_latents, dim=0).to(device, dtype=param_dtype)
             assert img_latents.shape[2] == 1
             
@@ -280,17 +274,16 @@ def main():
                                                 seq_len=seq_len, 
                                                 img_latent=img_latents,
                                                 clip_feat=clip_feat,
-                                                action=actions)
+                                                action=actions) # action is Noneable
                 
                 if isinstance(velocity_pred_list, (list, tuple)):
                     velocity_pred = torch.stack(velocity_pred_list, dim=0)
                 else:
                     velocity_pred = velocity_pred_list
-
-                alpha = ds_engine.module.alpha
-                alpha_loss = F.mse_loss(alpha, alpha.new_ones(alpha.shape))
-                alpha_significance = global_step / args.alpha_significance_step
-                if args.alpha_loss:
+                if args.train_task != "i2v":
+                    alpha = ds_engine.module.alpha
+                    alpha_loss = F.mse_loss(alpha, alpha.new_ones(alpha.shape))
+                    alpha_significance = global_step / args.alpha_significance_step
                     loss = F.mse_loss(velocity_pred, target) + alpha_significance * alpha_loss
                 else:
                     loss = F.mse_loss(velocity_pred, target)
@@ -307,9 +300,10 @@ def main():
             if is_rank0 and (global_step % args.log_every == 0):
                 writer.add_scalar("Loss/train", loss.item(), global_step)
                 print(f"[Step {global_step}] Loss: {loss.item():.6f}")
-                alpha_value = ds_engine.module.alpha.item()  # 注意：应该是 i2v_alpha 而不是 alpha
-                writer.add_scalar("Alpha", alpha_value, global_step)
-                print(f"[Step {global_step}] Alpha: {alpha_value:.6f}")
+                if args.train_task != "i2v":
+                    alpha_value = ds_engine.module.alpha.item()  # 注意：应该是 i2v_alpha 而不是 alpha
+                    writer.add_scalar("Alpha", alpha_value, global_step)
+                    print(f"[Step {global_step}] Alpha: {alpha_value:.6f}")
 
             # --- checkpoint save by global step ---
             if global_step % args.save_every == 0:

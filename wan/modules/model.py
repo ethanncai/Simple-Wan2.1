@@ -458,7 +458,9 @@ class WanModel(ModelMixin, ConfigMixin):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 model_variation = "i2v" , # "i2v or ia2v"
+                 use_clip=False,
+                 eps=1e-6):        
         r"""
         Initialize the diffusion model backbone.
 
@@ -499,7 +501,9 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # assert model_type in ['t2v', 'i2v', 'flf2v', 'vace']
         # self.model_type = model_type
-
+        assert model_variation in ["i2v","ia2v"]
+        print(f"Initializing WanModel with variation: {model_variation}")
+        self.model_variation = model_variation
         self.patch_size = patch_size
         self.text_len = text_len
         self.in_dim = in_dim
@@ -515,6 +519,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.use_clip = use_clip
 
         # precalculate the shape related params
 
@@ -526,7 +531,8 @@ class WanModel(ModelMixin, ConfigMixin):
         self.grid_size = torch.tensor([target_latent_t, target_h_patches, target_w_patches])
 
         # alpha
-        self.alpha = nn.Parameter(torch.tensor(1e-3))
+        if self.model_variation == "ia2v": 
+            self.alpha = nn.Parameter(torch.tensor(1e-3))
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -542,12 +548,14 @@ class WanModel(ModelMixin, ConfigMixin):
         # clip projection
         CLIP_DIM = 768
         VAE_T_RATIO = 4
-        self.projector = nn.Linear(CLIP_DIM, dim, bias=True)
+        if self.use_clip:
+            self.projector = nn.Linear(CLIP_DIM, dim, bias=True)
 
-        self.action_resampler = ActionResampler(
-            action_dim=self.action_dim,
-            dim=self.dim,
-            downsample_ratio=VAE_T_RATIO) # B,T_pixle,action_dim -> B, T_latent,dim
+        if self.model_variation == "ia2v":      
+            self.action_resampler = ActionResampler(
+                action_dim=self.action_dim,
+                dim=self.dim,
+                downsample_ratio=VAE_T_RATIO) # B,T_pixle,action_dim -> B, T_latent,dim
 
         # blocks
         self.blocks = nn.ModuleList([
@@ -556,13 +564,16 @@ class WanModel(ModelMixin, ConfigMixin):
             for _ in range(num_layers)
         ])
 
-        self.action_blocks = nn.ModuleList([
-            FrameWiseCrossAttention(dim=dim, num_heads=num_heads,
-                              window_size=window_size, qk_norm=qk_norm, tokens_per_frame=self.tokens_per_frame,eps=eps)
-            for _ in range(num_action_layers)
-        ])
+        if self.model_variation == "ia2v":
+            self.action_blocks = nn.ModuleList([
+                FrameWiseCrossAttention(dim=dim, num_heads=num_heads,
+                                window_size=window_size, qk_norm=qk_norm, tokens_per_frame=self.tokens_per_frame,eps=eps)
+                for _ in range(num_action_layers)
+            ])
+            self.transformer_block_lists = [self.blocks, self.action_blocks]
+        else:
+            self.transformer_block_lists = [self.blocks]
 
-        self.transformer_block_lists = [self.blocks, self.action_blocks]
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
 
@@ -619,14 +630,16 @@ class WanModel(ModelMixin, ConfigMixin):
         # process action
         assert len(x) == len(img_latent) and len(x) == len(context), "inconsists len"
         B = len(x)
-        action = torch.stack(action) # batchify to B, raw_frame, dim
-        action_aligned = self.action_resampler(action) # (B,T_pixle,action_dim) -> (B, T_latent,dim)
+        action_aligned = None
+        if self.model_variation == "ia2v": 
+            action = torch.stack(action) # batchify to B, raw_frame, dim
+            action_aligned = self.action_resampler(action) # (B,T_pixle,action_dim) -> (B, T_latent,dim)
 
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # latent space hard replace
+        # latent space hard replace， 不管是 i2v 还是 ia2v 都需要这个操作。
         x_ = []
         for u,img in zip(x,img_latent):
             u_new = u.clone()
@@ -661,8 +674,11 @@ class WanModel(ModelMixin, ConfigMixin):
                 for u in context
             ]))
 
-        clip_feat = self.projector(clip_feat) # B, dim
-        clip_feat = clip_feat.unsqueeze(1) # B, 1, dim
+        if self.use_clip: 
+            clip_feat = self.projector(clip_feat) # B, dim
+            clip_feat = clip_feat.unsqueeze(1) # B, 1, dim
+        else:
+            clip_feat = None
             # context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
             # context_iv = torch.concat([context_clip, context], dim=1)
 
@@ -678,11 +694,14 @@ class WanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             clip_feat=clip_feat, # B,dim
             clip_lens=clip_lens,
-            action=action_aligned
+            action=action_aligned # None able
             )
         
         # altering_forward = create_alternating_forward(self.blocks, self.i2v_extension_blocks, grad_checkpoint=grad_checkpoint)
-        block_moduli, img_moduli = self.moduli
+        if self.model_variation == "i2v":
+            block_moduli = 1
+        elif self.model_variation == "ia2v":
+            block_moduli, action_block_moduli = self.moduli
         assert block_moduli == 1 # main block
         # print(x.shape)
         for i in range(len(self.blocks)):
@@ -697,20 +716,22 @@ class WanModel(ModelMixin, ConfigMixin):
                 kwargs['context_lens'],
                 use_reentrant=False
             )
-            x_ = None
-            if i % img_moduli == 0 and i // img_moduli < len(self.action_blocks):
-                # print(f"triggered -> {i // img_moduli}")
-                x_ = grad_checkpoint(
-                    self.action_blocks[i // img_moduli],
-                    x,
-                    kwargs['e'],
-                    kwargs['action'],
-                    kwargs['seq_lens'],
-                    kwargs['grid_sizes'],
-                    kwargs['freqs'],
-                    use_reentrant=False
-                )
-            x = x if x_ is None else x + self.alpha * x_
+            if self.model_variation == "ia2v":
+                x_ = None
+                
+                if i % action_block_moduli == 0 and i // action_block_moduli < len(self.action_blocks):
+                    # print(f"triggered -> {i // img_moduli}")
+                    x_ = grad_checkpoint(
+                        self.action_blocks[i // action_block_moduli],
+                        x,
+                        kwargs['e'],
+                        kwargs['action'],
+                        kwargs['seq_lens'],
+                        kwargs['grid_sizes'],
+                        kwargs['freqs'],
+                        use_reentrant=False
+                    )
+                x = x if x_ is None else x + self.alpha * x_
             # print(x.shape)
         x = self.head(x, e)
 

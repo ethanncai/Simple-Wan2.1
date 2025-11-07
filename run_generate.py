@@ -18,49 +18,27 @@ from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CON
 from wan.utils.utils import cache_image, cache_video, str2bool
 
 
-def _validate_args(args):
-    # Basic check
-    assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
-    assert args.task in WAN_CONFIGS, f"Unsupported task: {args.task}"
-    
-    # Set default sampling steps
-    if args.sample_steps is None:
-        args.sample_steps = 50
-        if "i2v" in args.task:
-            args.sample_steps = 40
-
-    # Set default shift
-    if args.sample_shift is None:
-        args.sample_shift = 5.0
-        if "i2v" in args.task and args.size in ["832*480", "480*832"]:
-            args.sample_shift = 3.0
-        elif "flf2v" in args.task or "vace" in args.task:
-            args.sample_shift = 16
-
-    # Set default frame_num
-    if args.frame_num is None:
-        args.frame_num = 1 if "t2i" in args.task else 81
-
-    # T2I frame_num check
-    if "t2i" in args.task:
-        assert args.frame_num == 1, f"Unsupported frame_num {args.frame_num} for task {args.task}"
-
-    args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(0, sys.maxsize)
-
-    # Size check
-    assert args.size in SUPPORTED_SIZES[args.task], \
-        f"Unsupported size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
-
-
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Generate an image or video from a text prompt using Wan (single-GPU mode)"
+    )
+    parser.add_argument(
+        "--gen_task",
+        type=str,
+        default="ia2v",
+        choices=["i2v", "ia2v"],
+        help="The generation task to run."
     )
     parser.add_argument(
         "--img_path",
         type=str,
         required=True,
         help="initial frame")
+    parser.add_argument(
+        "--action_metadata_path",
+        type=str,
+        default=None,
+        help="this point to a directory, which contains ex.json in.json h5 file")
     parser.add_argument(
         "--task",
         type=str,
@@ -76,7 +54,7 @@ def _parse_args():
     parser.add_argument(
         "--frame_num",
         type=int,
-        default=None,
+        default=81,
         help="How many frames to sample. Should be 4n+1 (or 1 for t2i)."
     )
     parser.add_argument(
@@ -117,7 +95,7 @@ def _parse_args():
     parser.add_argument(
         "--sample_steps",
         type=int,
-        default=None,
+        default=50,
         help="Number of sampling steps."
     )
     parser.add_argument(
@@ -134,7 +112,7 @@ def _parse_args():
     )
 
     args = parser.parse_args()
-    _validate_args(args)
+    # _validate_args(args)
     return args
 
 
@@ -158,6 +136,7 @@ def generate(args):
 
     logging.info("Creating WanT2V pipeline.")
     wan_t2v_pipeline = wan.GenPipeline(
+        gen_task=args.gen_task,
         model_hyperparam=model_hyperparam,
         checkpoint_dir=args.ckpt_dir,
         t5_cpu=args.t5_cpu,
@@ -166,6 +145,7 @@ def generate(args):
     logging.info("Generating video...")
     video = wan_t2v_pipeline.generate(
         img_path=args.img_path,
+        action_metadata_path=args.action_metadata_path,
         input_prompt=args.prompt,
         size=SIZE_CONFIGS[args.size],
         frame_num=args.frame_num,
@@ -186,7 +166,7 @@ def generate(args):
     cache_video(
         tensor=video[None],
         save_file=args.save_file,
-        fps=model_hyperparam.sample_fps,
+        fps=5,
         nrow=1,
     )
     logging.info("Finished.")

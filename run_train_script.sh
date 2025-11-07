@@ -18,5 +18,6 @@ deepspeed \
     --num_gpus $NUM_GPUS \
     $SCRIPT \
     --ds_config $DS_CONFIG \
+    --train_task "i2v" \
     2>&1 | tee training_$(date +%Y%m%d_%H%M%S).log
 

@@ -11,18 +11,20 @@ from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 import torch
 import torch.cuda.amp as amp
 from tqdm import tqdm
-from .utils.train_utils import load_weights, load_and_preprocess_image
+from .utils.train_utils import load_weights, load_and_preprocess_image, stretchly_resize, cthw_to_video
 from .modules.model import WanModel
 from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
 from .modules.clip import ClipImageEncoder
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.action_utils import get_action_with_vp, action_relative_to_0, scale_action
 
 
 class GenPipeline:
 
     def __init__(
         self,
+        gen_task,
         model_hyperparam,
         checkpoint_dir,
         t5_cpu=False,
@@ -38,6 +40,7 @@ class GenPipeline:
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU during encoding.
         """
+        self.gen_task = gen_task
         self.device = torch.device("cuda:0")
         self.model_hyperparam = model_hyperparam
         self.t5_cpu = t5_cpu
@@ -68,8 +71,8 @@ class GenPipeline:
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
-        self.model = WanModel()
-        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Simple-Wan2.1/exp/exp_ds_10311505/ds_step_2880')
+        self.model = WanModel(model_variation=self.gen_task)
+        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Simple-Wan2.1/exp/exp_ds_11052144/ds_step_1740')
 
         # 3. 加载到模型（strict=False 可跳过不匹配的键，比如 head 不同）
         # self.model.load_state_dict(state_dict, strict=True)``
@@ -82,8 +85,9 @@ class GenPipeline:
 
     def generate(
         self,
-        img_path,
-        input_prompt,
+        img_path=None,
+        action_metadata_path=None,
+        input_prompt=None,
         size=(1280, 720),
         frame_num=81,
         shift=5.0,
@@ -91,7 +95,8 @@ class GenPipeline:
         guide_scale=5.0,
         n_prompt="",
         seed=-1,
-        offload_model=True
+        offload_model=True,
+        action_sample_interval=6
     ):
         r"""
         Generates video frames from text prompt using diffusion process (single-GPU).
@@ -132,7 +137,50 @@ class GenPipeline:
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
+        
+        # Get action input 
+        if self.gen_task == "ia2v":
+            # ACTION_SAMPLE_INTERVAL = 2
+            ex_json_path = os.path.join(action_metadata_path, "head_extrinsic_params_aligned.json")
+            in_json_path = os.path.join(action_metadata_path, "head_intrinsic_params.json")
+            h5_json_path = os.path.join(action_metadata_path, "proprio_stats.h5")
 
+            action_tdim, vp_cthw = get_action_with_vp(
+                h5_json_path, in_json_path, ex_json_path, radius=50,
+                output_vp=True, action_transform=action_relative_to_0
+            )
+            vp_cthw = stretchly_resize(vp_cthw, (H, W))
+            
+            
+            action_tdim = scale_action(action_tdim)
+            action_len = action_tdim.shape[0]
+            raw_frame_num = frame_num * action_sample_interval
+            if action_len < raw_frame_num:
+                pad = raw_frame_num - action_len
+                action_tdim = torch.cat(
+                    [action_tdim, action_tdim[-1:].repeat_interleave(pad, dim=0)],
+                    dim=0
+                )
+                vp_cthw = torch.cat(
+                    [vp_cthw, vp_cthw[:, -1:].repeat_interleave(pad, dim=1)],
+                    dim=1
+                )
+            
+            elif action_len > raw_frame_num:
+                action_tdim = action_tdim[:raw_frame_num,:] # we only need the first frame
+            
+            indices = torch.arange(0, raw_frame_num, action_sample_interval)
+            action_tdim = action_tdim[indices, :]
+            vp_cthw = vp_cthw[:, indices, :, :]
+            assert action_tdim.shape[0] == frame_num, "mismatched in action T"
+            
+            print("Saving vp video")
+            # assert len(vp_cthw) == 1, "vp len in inference code should always be one, but got {}"
+            cthw_to_video(vp_cthw, "inference_VP.mp4", fps=5)
+            print("Saved vp video")
+        
+            
+            
         # Get init frame latent
         img_tensor_pixle = load_and_preprocess_image(img_path, target_size=(H, W))
         clip_feat = self.clip_encoder(img_tensor_pixle.unsqueeze(0))
@@ -187,6 +235,7 @@ class GenPipeline:
             latents = noise
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
+            action_tdim = [action_tdim.to(device=self.device, dtype=self.param_dtype)]
 
             for t in tqdm(timesteps):
                 latent_model_input = latents
@@ -196,10 +245,9 @@ class GenPipeline:
 
                 # uncond_img_latents = [torch.zeros_like(u).to(u) for u in img_latents] # for cfg use
                 image_tensor = img_latents[0].clone() # CTHW
-            
                 assert len(image_tensor.shape) == 4
-                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c, img_latent=img_latents,clip_feat=clip_feat)[0]
-                noise_pred_uncond = self.model(latent_model_input, t=timestep, **arg_null, img_latent=img_latents,clip_feat=clip_feat)[0]
+                noise_pred_cond = self.model(latent_model_input, t=timestep, **arg_c, img_latent=img_latents,clip_feat=clip_feat,action=action_tdim)[0]
+                noise_pred_uncond = self.model(latent_model_input, t=timestep, **arg_null, img_latent=img_latents,clip_feat=clip_feat,action=action_tdim)[0]
 
                 noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 

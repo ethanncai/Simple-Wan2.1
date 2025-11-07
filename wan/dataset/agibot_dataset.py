@@ -69,7 +69,7 @@ class AgibotDataset(torch.utils.data.Dataset):
         target_w,
         target_h,
         target_frames=81,
-        sample_interval=6,  # means slow down 6x
+        sample_interval=2,  # means slow down 6x
         tries=10000,
         agibot_dataset_path=None,
         agibot_task_info_path=None,
@@ -302,7 +302,7 @@ if __name__ == '__main__':
 
     dataset = AgibotDataset(
         target_frames=81,
-        sample_interval=6,
+        sample_interval=2,
         target_h=480,
         target_w=832,
         agibot_dataset_path=agibot_dataset_path,
@@ -331,11 +331,11 @@ if __name__ == '__main__':
         cnt += 1
         video_list, action_list, text_list, vp_list = video_data
         print(f"Step {cnt}")
-        if cnt == 11:
+        if cnt == 1:
             print(video_list[0].shape)
             print(text_list[0])
             print(action_list[0].shape)
             print(vp_list[0].shape)
-            cthw_to_video(video_list[0], "meow.mp4", fps=5)
-            cthw_to_video(vp_list[0], "mewo_vp.mp4", fps=5)
+            cthw_to_video(video_list[0], "meow.mp4", fps=16)
+            cthw_to_video(vp_list[0], "mewo_vp.mp4", fps=16)
             break
