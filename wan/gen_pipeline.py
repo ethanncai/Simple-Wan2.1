@@ -72,7 +72,7 @@ class GenPipeline:
         logging.info(f"Creating WanModel from {checkpoint_dir}")
 
         self.model = WanModel(model_variation=self.gen_task)
-        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Simple-Wan2.1/exp/exp_ds_11052144/ds_step_1740')
+        load_state_dict_from_zero_checkpoint(self.model,'/home/rapverse/workspace_junzhi/Simple-Wan2.1/exp/exp_ds_11080049/ds_step_600')
 
         # 3. 加载到模型（strict=False 可跳过不匹配的键，比如 head 不同）
         # self.model.load_state_dict(state_dict, strict=True)``
@@ -178,7 +178,8 @@ class GenPipeline:
             # assert len(vp_cthw) == 1, "vp len in inference code should always be one, but got {}"
             cthw_to_video(vp_cthw, "inference_VP.mp4", fps=5)
             print("Saved vp video")
-        
+        else:
+            action_tdim = None
             
             
         # Get init frame latent
@@ -235,7 +236,8 @@ class GenPipeline:
             latents = noise
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
-            action_tdim = [action_tdim.to(device=self.device, dtype=self.param_dtype)]
+            if self.gen_task == "ia2v":
+                action_tdim = [action_tdim.to(device=self.device, dtype=self.param_dtype)]
 
             for t in tqdm(timesteps):
                 latent_model_input = latents

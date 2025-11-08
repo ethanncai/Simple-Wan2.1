@@ -35,7 +35,7 @@ def parse_args():
     parser.add_argument("--log_dir", type=str, default="runs")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=100000)
-    parser.add_argument("--save_every", type=int, default=60)  # 默认以step计
+    parser.add_argument("--save_every", type=int, default=300)  # 默认以step计
     parser.add_argument("--log_every", type=int, default=5)    # 默认以step计
     parser.add_argument("--text_len", type=int, default=512)
     parser.add_argument("--frame_num", type=int, default=81)
